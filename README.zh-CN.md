@@ -6,11 +6,12 @@
 
 ## 功能特性
 
-- **可折叠的活动时间线：** 不再让大量独立调用填满对话。工作进行时，所有内置与第三方工具会集中显示为一行 `Running(...)`；工作结束后，则变为低调的 `Done(...)`。父级会统计工具调用和思考数量；展开后，工具、`● thought` 和扩展更新会按 transcript 顺序显示，成员摘要在展开嵌套详情后仍然保留。
+- **可折叠的活动时间线：** 不再让大量独立调用填满对话。思考、工具和普通 `info` 通知会进入同一条按真实时间排序的活动流；工作进行时显示为 `Running(...)`，结束后变为低调的 `Done(...)`。父级只统计工具调用和思考数量；展开后可查看所有有序成员，成员摘要在展开嵌套详情后仍然保留。思考与工具地位相同：没有调用任何工具的那一轮同样会有自己的 `Running(1 thought)` / `Done(1 thought)` 父行，思考作为其子级，内容不会被丢弃。
+- **临时 UI 状态：** 编辑器上方的一行只显示 Pi 直接产生的 UI 操作反馈，例如 Thinking 或工具输出可见性变化。新状态会替换旧状态，并在十秒后自动消失，不进入 transcript 或 session。
 - **按需查看有效信息：** 针对不同工具设计的摘要，会简洁呈现路径、命令、结果、diff、文件预览和实时 shell 输出，同时保留查看原始完整内容的能力。
 - **统一、精致的视觉体验：** 圆角用户消息与输入框、主题感知配色、层级清晰的 Markdown 标题、更清爽的列表，以及带语法高亮的圆角代码块，让整个 TUI 更协调。在 fullscreen 模式下，每个围栏代码块还带有符合原生体验的 `[Copy]` 控件。
 
-Pi 内置的 `read`、`bash`、`edit`、`write`、`grep`、`find` 和 `ls` 工具使用专门设计的紧凑视图；所有第三方工具会自动获得统一的紧凑行，单独展开时继续使用原生 renderer，但会移除与整体冲突的终端背景色。系统错误、steer 消息、compaction 摘要和可见 assistant 正文保持可见，并形成硬分组边界。同时不会影响 Pi 原有的光标、输入法、自动补全、鼠标交互和工具执行行为。
+Pi 内置的 `read`、`bash`、`edit`、`write`、`grep`、`find` 和 `ls` 工具使用专门设计的紧凑视图；所有第三方工具会自动获得统一的紧凑行，单独展开时继续使用原生 renderer，但会移除与整体冲突的终端背景色。用户与 steer 消息、compaction 摘要、可见 assistant 正文、warning、error、aborted/length 响应，以及注册了专用 renderer 的 displayed custom message 都会形成硬分组边界。同时不会影响 Pi 原有的光标、输入法、自动补全、鼠标交互和工具执行行为。
 
 ## 安装
 
@@ -26,7 +27,11 @@ Pi 可能会提示内置工具被覆盖。这是正常现象：pi-pretty-tui 会
 
 点击 `Running(...)` 或 `Done(...)` 行，可以保留父级并展开其下方的工具、已完成的 `● thought` 和扩展更新。点击单个工具或思考子项可在保留摘要的同时展开嵌套详情，再次点击父级可折叠整个分组。任何时候都可以按 `Ctrl+O`，使用 Pi 的全局展开控制来显示或隐藏全部工具输出和思考内容。工具名称会原样使用定义中的 `label`，没有 `label` 时回退到原始 `name`；pi-pretty-tui 不再重命名或转换大小写。
 
-扩展 info 通知与没有自有 renderer 的 displayed custom message 会按真实时间顺序显示为 `◇` 更新成员。若消息在下一轮工具活动之前到达，它会先作为独立更新保持可见，并在活动组建立后成为该组的首个成员。进入分组后，更新成员随父级折叠隐藏，且不计入工具或思考数量。displayed custom message 保留 session 持久化语义，info 通知仍仅存在于当前 runtime。注册了语义化 renderer 的 custom message 会保留为 transcript 中的原生独立消息块，因此后台任务管理器等扩展仍能显示简洁的状态信息。warning 和 error 继续使用 Pi 原生的即时展示方式。
+扩展调用 `ctx.ui.notify(message, "info")`（或省略 type）时，如果当前已有 thought/tool 活动组，通知会按真实时间顺序加入该组；如果没有现有工作，则独立显示，并且不会附着到未来的工具组。warning 和 error 保持独立，分别使用黄色 `⚠` 和红色 `✕`，并形成硬边界。工具失败继续归属于对应工具详情。上述扩展通知和错误都不会进入临时 UI 状态栏。
+
+没有自有 renderer 的 displayed custom message 使用统一、accent 配色的 `◇` Markdown 显示：当前存在 thought/tool 工作时加入当前组，否则独立显示，并保留 session 持久化。注册了 renderer 的消息完全保留插件原生显示并形成硬边界。所有判断只依据 Pi 的通知 type 和 renderer 是否存在，不识别扩展名称、custom message 名称，也不根据文本内容推断语义。
+
+Pi 内部直接调用 `showStatus()` 产生的反馈属于临时 UI 状态：它只显示在编辑器上方，新状态替换旧状态，并由十秒 timer 自动清除；它不会进入 transcript 或活动时间线，reload 时也会清除。在 clean 模式下，`Ctrl+T` 不修改 Pi 持久化的 Thinking 设置，只显示一条简短提示；thought 详情仅在点击对应子项时展开，`Ctrl+O` 继续负责全局活动展开。在 full 和 compact 模式下，`Ctrl+T` 保留 Pi 的原生行为。
 
 ## 设置与渲染模式
 
@@ -53,11 +58,11 @@ npm install
 npm test
 ```
 
-测试覆盖实时与历史恢复的活动时间线、system/steer/compaction 边界、内置与第三方工具、可展开思考、并行工具完成归属、孤立 tool call、重复摘要防护，以及 fullscreen 代码块复制的点击区域。GitHub Actions 会在每次 push 和 pull request 时运行相同检查。
+测试覆盖实时与历史恢复的活动时间线、自动重试与终止状态、用户/steer/compaction/原生 renderer 边界、十秒 UI 状态替换、reload 与 shutdown 时的旧 timer 与状态清理、独立严重级别样式、内置与第三方工具、可展开思考、并行工具完成归属、孤立 tool call、重复摘要防护、原型补丁的完整恢复，以及 fullscreen 代码块复制的点击区域。GitHub Actions 会在每次 push 和 pull request 时运行相同检查。
 
 ## 兼容性说明
 
-工具渲染使用 Pi 的公开扩展 API。思考内容的可见性与活动工具状态，通过 Pi 导出的交互组件跟随其内置展开和执行状态变化。由于 Pi 目前没有为这些展示细节提供公开渲染钩子，原生用户消息框、原生输入编辑器圆角、无序列表标记和围栏代码块增强需要使用可安全重载的运行时补丁。Markdown 增强仅在渲染主 transcript 中的用户消息和助手回复时启用；扩展 overlay 创建的 Markdown 保持 Pi 原生布局。Markdown 解析、语法高亮和终端语义区域仍由 Pi 处理。
+工具渲染使用 Pi 的公开扩展 API。活动工具状态通过 Pi 导出的交互组件跟随其内置执行状态变化；clean 模式的 thought 详情使用活动时间线自身的展开状态，full 和 compact 模式则保留 Pi 内置的 Thinking 可见性控制。由于 Pi 目前没有为这些展示细节提供公开渲染钩子，原生用户消息框、原生输入编辑器圆角、无序列表标记和围栏代码块增强需要使用可安全重载的运行时补丁。Markdown 增强仅在渲染主 transcript 中的用户消息和助手回复时启用；扩展 overlay 创建的 Markdown 保持 Pi 原生布局。Markdown 解析、语法高亮和终端语义区域仍由 Pi 处理。
 
 本扩展不会修改 Pi 源文件。运行时补丁会在会话关闭时移除，但未来的 Pi 版本可能需要本扩展同步适配。
 

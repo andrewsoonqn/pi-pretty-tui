@@ -6,19 +6,66 @@ import { createJiti } from "jiti";
 import {
   AssistantMessageComponent,
   CustomMessageComponent,
+  CustomEditor,
   InteractiveMode,
   ToolExecutionComponent,
+  UserMessageComponent,
   initTheme,
 } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text, TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
 import {
   ActivityTimeline,
-  assistantSystemBoundary,
+  assistantTerminalState,
 } from "../extensions/activity-timeline.ts";
 
 const agentDir = mkdtempSync(join(tmpdir(), "pi-pretty-tui-test-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
 initTheme("dark", false);
+
+// Snapshots taken before the extension is loaded so session_shutdown can be
+// checked for a complete restore of every patched method.
+const originalPrototypeMethods = [
+  ["Markdown.invalidate", Markdown.prototype, "invalidate"],
+  ["Markdown.render", Markdown.prototype, "render"],
+  ["Markdown.renderToken", Markdown.prototype, "renderToken"],
+  ["Markdown.handleMouse", Markdown.prototype, "handleMouse"],
+  ["AssistantMessageComponent.updateContent", AssistantMessageComponent.prototype, "updateContent"],
+  ["AssistantMessageComponent.render", AssistantMessageComponent.prototype, "render"],
+  ["AssistantMessageComponent.handleMouse", AssistantMessageComponent.prototype, "handleMouse"],
+  ["CustomMessageComponent.render", CustomMessageComponent.prototype, "render"],
+  ["CustomMessageComponent.handleMouse", CustomMessageComponent.prototype, "handleMouse"],
+  ["ToolExecutionComponent.markExecutionStarted", ToolExecutionComponent.prototype, "markExecutionStarted"],
+  ["ToolExecutionComponent.setExpanded", ToolExecutionComponent.prototype, "setExpanded"],
+  ["ToolExecutionComponent.render", ToolExecutionComponent.prototype, "render"],
+  ["ToolExecutionComponent.handleMouse", ToolExecutionComponent.prototype, "handleMouse"],
+  ["InteractiveMode.setToolsExpanded", InteractiveMode.prototype, "setToolsExpanded"],
+  ["InteractiveMode.renderSessionEntries", InteractiveMode.prototype, "renderSessionEntries"],
+  ["InteractiveMode.switchTuiMode", InteractiveMode.prototype, "switchTuiMode"],
+  ["InteractiveMode.showExtensionNotify", InteractiveMode.prototype, "showExtensionNotify"],
+  ["InteractiveMode.toggleThinkingBlockVisibility", InteractiveMode.prototype, "toggleThinkingBlockVisibility"],
+  ["InteractiveMode.showStatus", InteractiveMode.prototype, "showStatus"],
+  ["InteractiveMode.showWarning", InteractiveMode.prototype, "showWarning"],
+  ["InteractiveMode.showError", InteractiveMode.prototype, "showError"],
+  ["TuiAltScreen.handleSelectionMouseEvent", TuiAltScreen.prototype, "handleSelectionMouseEvent"],
+  ["CustomEditor.render", CustomEditor.prototype, "render"],
+  ["CustomEditor.handleMouse", CustomEditor.prototype, "handleMouse"],
+  ["UserMessageComponent.rebuild", UserMessageComponent.prototype, "rebuild"],
+].map(([label, target, method]) => [label, target, method, target[method]]);
+
+const protoPatchKeys = [
+  ["Markdown", Markdown.prototype, Symbol.for("pretty-tui.code-blocks")],
+  ["AssistantMessageComponent", AssistantMessageComponent.prototype, Symbol.for("pretty-tui.clean-thinking")],
+  ["CustomMessageComponent", CustomMessageComponent.prototype, Symbol.for("pretty-tui.clean-custom-message")],
+  ["ToolExecutionComponent", ToolExecutionComponent.prototype, Symbol.for("pretty-tui.clean-tool-execution")],
+  ["InteractiveMode", InteractiveMode.prototype, Symbol.for("pretty-tui.clean-tool-expansion")],
+  ["CustomEditor", CustomEditor.prototype, Symbol.for("pretty-tui.rounded-editor-frame")],
+  ["UserMessageComponent", UserMessageComponent.prototype, Symbol.for("pretty-tui.user-message-frame")],
+  ["Markdown", Markdown.prototype, Symbol.for("pretty-tui.list-bullets")],
+].map(([label, owner, symbol]) => ({ label, owner, symbol }));
+
+const symbolPatchKeys = [
+  ["TuiAltScreen", TuiAltScreen.prototype, Symbol.for("pretty-tui.clean-summary-click")],
+].map(([label, owner, symbol]) => ({ label, owner, symbol }));
 
 const jiti = createJiti(import.meta.url);
 const extension = await jiti.import(join(process.cwd(), "extensions/index.ts"), { default: true });
@@ -26,6 +73,7 @@ const handlers = new Map();
 const tools = new Map();
 const commands = new Map();
 const appendedEntries = [];
+const widgets = new Map();
 const pi = {
   appendEntry(type, data) { appendedEntries.push({ type, data }); },
   on(name, handler) {
@@ -43,6 +91,12 @@ const theme = {
   bold: (text) => text,
   fg: (_name, text) => text,
 };
+const widgetText = () => {
+  const factory = widgets.get("pretty-tui-latest-activity");
+  if (!factory) return "";
+  return factory({}, theme).render(80).join("\n")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+};
 const emit = async (name, event = {}, ctx = {}) => {
   for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
 };
@@ -51,6 +105,10 @@ const sessionContext = (entries) => ({
   ui: {
     getToolsExpanded: () => false,
     notify() {},
+    setWidget(key, content) {
+      if (content === undefined) widgets.delete(key);
+      else widgets.set(key, content);
+    },
   },
 });
 const assistant = (id, parentId, calls, text) => ({
@@ -120,8 +178,8 @@ const renderCollapsedSummaries = async (entries) => {
 };
 const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool/.exec(output)?.[1]));
 
-// The transcript-first model keeps thinking and all tools in order while
-// system errors create hard boundaries.
+// The transcript-first model keeps thinking, tools, and updates in order
+// across explicit transcript boundaries.
 {
   const timeline = new ActivityTimeline();
   timeline.addThinking("m1", "Plan the work");
@@ -150,8 +208,25 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     timeline.groups()[2].members.map((member) => member.kind),
     ["update", "thinking", "tool"],
   );
-  assert.equal(assistantSystemBoundary({ role: "assistant", stopReason: "error", content: [] }), true);
-  assert.equal(assistantSystemBoundary({ role: "assistant", stopReason: "toolUse", content: [] }), false);
+  assert.equal(assistantTerminalState({ role: "assistant", stopReason: "error", content: [] }), true);
+  assert.equal(assistantTerminalState({ role: "assistant", stopReason: "toolUse", content: [] }), false);
+}
+
+// A group formed by the first thought must already accept update members: the
+// activity group exists before any tool has run, so "has work" cannot mean
+// "has tools". This is the single definition every caller relies on.
+{
+  const timeline = new ActivityTimeline();
+  assert.equal(timeline.hasWork(undefined), false);
+  timeline.addThinking("thought-only", "Plan before acting");
+  const group = timeline.currentGroup();
+  assert.equal(timeline.hasWork(group), true);
+  assert.deepEqual(group.toolCallIds, []);
+  assert.equal(timeline.addUpdate("thought-only-update", "Index ready", "body", false)?.kind, "update");
+  assert.deepEqual(group.members.map((member) => member.kind), ["thinking", "update"]);
+  const started = new ActivityTimeline();
+  started.addTool("t1", "read");
+  assert.equal(started.hasWork(started.currentGroup()), true);
 }
 
 // Restored groups derive thought counts from transcript members, including
@@ -319,7 +394,8 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   assert.ok(!responseBoundaryText.includes("responding"));
 }
 
-// Assistant/system errors are hard boundaries and remain outside activity groups.
+// Assistant/system errors are standalone hard boundaries, so a later retry
+// starts a fresh activity group.
 {
   appendedEntries.length = 0;
   await emit("session_start", {}, sessionContext([]));
@@ -336,21 +412,35 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     appendedEntries.at(-1).data.groups.map((group) => group.lastToolCallId),
     ["before-system-error", "after-system-error"],
   );
+  assert.deepEqual(
+    appendedEntries.at(-1).data.groups.map((group) => group.toolCallIds),
+    [["before-system-error"], ["after-system-error"]],
+  );
 }
 
-// Info notifications without a valid activity group fail open to Pi's native
-// notification path instead of being dropped.
+// A host that cannot accept transcript components must not leak an extension
+// notification into the transient UI flash. The fallback routes straight to
+// Pi's original method for that severity instead of re-entering the patched
+// showStatus/showWarning/showError, and degrades to nothing when even the
+// original cannot render on that host.
 {
+  widgets.clear();
   await emit("session_start", {}, sessionContext([]));
-  const nativeInfo = [];
-  InteractiveMode.prototype.showExtensionNotify.call({
-    showStatus(message) { nativeInfo.push(message); },
-  }, "Standalone info", "info");
-  assert.deepEqual(nativeInfo, ["Standalone info"]);
+  const unreachableHost = { ui: { requestRender() {} }, chatContainer: {} };
+  for (const severity of ["info", "warning", "error"]) {
+    assert.doesNotThrow(() => {
+      InteractiveMode.prototype.showExtensionNotify.call(
+        unreachableHost,
+        `Unreachable ${severity}`,
+        severity,
+      );
+    });
+  }
+  assert.equal(widgets.has("pretty-tui-latest-activity"), false);
 }
 
-// An informational notification can arrive before its next tool event. It is
-// visible immediately, then becomes the clickable first member of that group.
+// An informational notification without existing model/tool work remains an
+// independent update and never attaches itself to a later tool group.
 {
   await emit("session_start", {}, sessionContext([]));
   const pendingInfoComponents = [];
@@ -361,29 +451,21 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   };
   InteractiveMode.prototype.showExtensionNotify.call(
     pendingInfoHost,
-    "⚡ SoL-Pi · Observation Pack\nMoney saved · 2,770 context tokens avoided",
+    "Indexing complete\n2,770 context tokens avoided",
     "info",
   );
   assert.equal(pendingInfoComponents.length, 1);
   const standaloneInfo = pendingInfoComponents[0].render(80).join("\n")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-  assert.ok(standaloneInfo.includes("SoL-Pi · Observation Pack"));
-  assert.ok(standaloneInfo.includes("Money saved"));
+  assert.ok(standaloneInfo.includes("Indexing complete"));
+  assert.ok(standaloneInfo.includes("2,770 context tokens avoided"));
   await emit("agent_start");
   await emit("tool_execution_start", { toolName: "bash", toolCallId: "after-pending-info" });
   const pendingInfoParent = pendingInfoComponents[0].render(80).join("\n")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-  assert.ok(pendingInfoParent.includes("Running("));
-  assert.ok(pendingInfoParent.includes("· bash)"));
-  assert.ok(!pendingInfoParent.includes("· Bash)"));
-  assert.ok(!pendingInfoParent.includes("Money saved"));
-  pendingInfoComponents[0].handleMouse({
-    type: "click", button: "left", x: 1, y: 1, width: 80, height: pendingInfoComponents[0].render(80).length,
-  });
-  const groupedInfo = pendingInfoComponents[0].render(80).join("\n")
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-  assert.ok(groupedInfo.includes("SoL-Pi · Observation Pack"));
-  assert.ok(groupedInfo.includes("Money saved"));
+  assert.ok(!pendingInfoParent.includes("Running("));
+  assert.ok(pendingInfoParent.includes("Indexing complete"));
+  assert.ok(pendingInfoParent.includes("2,770 context tokens avoided"));
   await emit("tool_execution_end", { toolName: "bash", toolCallId: "after-pending-info", isError: false });
   await emit("agent_settled");
 }
@@ -497,9 +579,8 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   assert.ok(rebuildingText.includes("Visible answer during rebuild"));
 }
 
-// A displayed custom message arriving after visible text can become the first
-// chronological member of the next tool group instead of remaining a purple
-// native block.
+// A displayed custom message arriving after visible text remains an independent
+// durable Activity Update instead of attaching itself to the next tool group.
 {
   const before = assistant("27", null, [{ id: "before-pending-update", name: "web_search" }]);
   const visibleBoundary = assistant("29", "28", [], "Initial answer");
@@ -532,24 +613,64 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   const pendingCustomComponent = new CustomMessageComponent(pendingCustomMessage);
   const pendingParent = pendingCustomComponent.render(80).join("\n")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-  assert.ok(pendingParent.includes("Done("));
+  assert.ok(!pendingParent.includes("Done("));
   assert.ok(!pendingParent.includes("[web-search-content-ready]"));
-  pendingCustomComponent.handleMouse({
-    type: "click", button: "left", x: 1, y: 1, width: 80, height: pendingCustomComponent.render(80).length,
-  });
-  const pendingCustomText = pendingCustomComponent.render(80).join("\n")
+  assert.ok(pendingParent.includes("Web Search Content Ready"));
+  assert.ok(pendingParent.includes("Content fetched for the next turn"));
+}
+
+// A displayed custom message injected directly by an extension can render
+// before Pi emits a model message_start event. Clean mode must claim it at the
+// component boundary instead of falling back to Pi's purple custom-message box,
+// and rich Markdown must keep its formatting.
+{
+  await emit("session_start", {}, sessionContext([]));
+  const liveCustomMessage = {
+    role: "custom",
+    timestamp: 33_000,
+    customType: "plannotator-complete",
+    content: "**Plan Complete!** ✓\n\n- [x] ~~Finish compatibility work.~~",
+    display: true,
+  };
+  const liveCustomComponent = new CustomMessageComponent(liveCustomMessage);
+  const liveCustomText = liveCustomComponent.render(80).join("\n")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-  assert.ok(pendingCustomText.includes("Web Search Content Ready"));
-  assert.ok(pendingCustomText.includes("Content fetched for the next turn"));
+  assert.ok(liveCustomText.includes("Plannotator Complete"));
+  assert.ok(liveCustomText.includes("Plan Complete! ✓"));
+  assert.ok(liveCustomText.includes("Finish compatibility work."));
+  assert.ok(!liveCustomText.includes("[plannotator-complete]"));
+  assert.ok(!liveCustomText.includes("**") && !liveCustomText.includes("~~"));
+
+  const restoredCustomEntry = {
+    type: "custom_message",
+    id: "33-restored",
+    parentId: null,
+    timestamp: "2026-01-01T00:00:33.000Z",
+    customType: liveCustomMessage.customType,
+    content: liveCustomMessage.content,
+    display: true,
+  };
+  await emit("session_start", {}, sessionContext([restoredCustomEntry]));
+  const restoredCustomComponent = new CustomMessageComponent({
+    ...liveCustomMessage,
+    timestamp: restoredCustomEntry.timestamp,
+  });
+  const restoredCustomText = restoredCustomComponent.render(80).join("\n")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  assert.ok(restoredCustomText.includes("Plannotator Complete"));
+  assert.ok(restoredCustomText.includes("Plan Complete! ✓"));
+  assert.ok(!restoredCustomText.includes("[plannotator-complete]"));
+  assert.ok(!restoredCustomText.includes("**") && !restoredCustomText.includes("~~"));
 }
 
 // Displayed custom messages with a registered semantic renderer remain native
 // standalone blocks and release timeline ownership before the next tool row.
 {
+  const semanticBefore = assistant("32", null, [{ id: "semantic-before-tool", name: "read" }]);
   const semanticEntry = {
     type: "custom_message",
     id: "34",
-    parentId: null,
+    parentId: "33",
     timestamp: "2026-01-01T00:00:34.000Z",
     customType: "background-task-notification",
     content: "<background-task-notification>model payload</background-task-notification>",
@@ -557,6 +678,8 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   };
   const semanticToolCall = assistant("35", "34", [{ id: "semantic-next-tool", name: "read" }]);
   await emit("session_start", {}, sessionContext([
+    semanticBefore,
+    result("33", "32", "semantic-before-tool"),
     semanticEntry,
     semanticToolCall,
     result("36", "35", "semantic-next-tool"),
@@ -586,6 +709,19 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   })?.handled, true);
   assert.equal(semanticMouseCalls, 1);
 
+  const semanticBeforeTool = new ToolExecutionComponent(
+    "read",
+    "semantic-before-tool",
+    { path: "before-semantic.txt" },
+    undefined,
+    { renderShell: "self", renderCall: () => new Text("before semantic", 0, 0) },
+    { requestRender() {} },
+    process.cwd(),
+  );
+  const semanticBeforeText = semanticBeforeTool.render(80).join("\n")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  assert.ok(semanticBeforeText.includes("Done(1 tool call"), semanticBeforeText);
+
   const semanticTool = new ToolExecutionComponent(
     "read",
     "semantic-next-tool",
@@ -595,15 +731,18 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     { requestRender() {} },
     process.cwd(),
   );
+  semanticTool.markExecutionStarted();
   const semanticToolText = semanticTool.render(80).join("\n")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-  assert.ok(semanticToolText.includes("Done("));
+  assert.ok(semanticToolText.includes("Done(1 tool call"), semanticToolText);
 }
 
-// Persisted custom_message entries restore as ordered activity updates instead
-// of falling back to Pi's purple CustomMessage box.
+// Persisted custom_message entries restore in transcript order inside their
+// activity group. The tree position is what proves the restore branch ran: when
+// it is skipped, the component-boundary fallback claims the message later and
+// appends it as the last member instead.
 {
-  const call = assistant("40", null, [{ id: "restored-custom-tool", name: "obs_recall" }]);
+  const firstCall = assistant("40", null, [{ id: "restored-custom-tool", name: "obs_recall" }]);
   const customEntry = {
     type: "custom_message",
     id: "42",
@@ -613,16 +752,18 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     content: "Content fetched for 1/2 URLs",
     display: true,
   };
+  // A later tool keeps the restored update in the middle of the group, where a
+  // late append cannot land.
+  const secondCall = assistant("44", "42", [{ id: "restored-custom-tail", name: "obs_recall" }]);
   const restoredEntries = [
-    call,
+    firstCall,
     result("41", "40", "restored-custom-tool"),
     customEntry,
+    secondCall,
+    result("45", "44", "restored-custom-tail"),
   ];
-  await emit("session_start", {}, sessionContext(restoredEntries.slice(0, 2)));
-  try {
-    InteractiveMode.prototype.renderSessionEntries.call({ ui: { mode: "fullscreen" } }, restoredEntries);
-  } catch {}
-  const restoredTool = new ToolExecutionComponent(
+  await emit("session_start", {}, sessionContext(restoredEntries));
+  const headTool = new ToolExecutionComponent(
     "obs_recall",
     "restored-custom-tool",
     {},
@@ -631,23 +772,59 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     { requestRender() {} },
     process.cwd(),
   );
-  const restoredCustomMessage = {
+  headTool.markExecutionStarted();
+  headTool.handleMouse({
+    type: "click", button: "left", x: 1, y: 1, width: 80, height: headTool.render(80).length,
+  });
+  const restoredCustom = new CustomMessageComponent({
     role: "custom",
     timestamp: customEntry.timestamp,
     customType: customEntry.customType,
     content: customEntry.content,
     display: true,
-  };
-  const restoredCustom = new CustomMessageComponent(restoredCustomMessage);
-  assert.equal(restoredCustom.render(80).length, 0);
-  const restoredParent = restoredTool.render(80);
-  restoredTool.handleMouse({
-    type: "click", button: "left", x: 1, y: 1, width: 80, height: restoredParent.length,
   });
   const restoredCustomText = restoredCustom.render(80).join("\n")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  assert.ok(restoredCustomText.includes("├─"), restoredCustomText);
+  assert.ok(!restoredCustomText.includes("└─"), restoredCustomText);
   assert.ok(restoredCustomText.includes("Web Search Content Ready"));
   assert.ok(restoredCustomText.includes("Content fetched for 1/2 URLs"));
+  assert.ok(!restoredCustomText.includes("[web-search-content-ready]"));
+}
+
+// A tool's own output text must never decide whether it failed. Pi supplies the
+// authoritative flag in the render context, so output that merely starts with
+// "Error:" must still render as a success.
+{
+  await emit("session_start", {}, sessionContext([]));
+  const bashTool = tools.get("bash");
+  const renderBashResult = (text, isError) => {
+    const context = {
+      toolCallId: "bash-output-text",
+      expanded: true,
+      executionStarted: true,
+      state: {},
+    };
+    return bashTool
+      .renderResult(
+        { content: [{ type: "text", text }], isError },
+        { expanded: true, isPartial: false },
+        theme,
+        { ...context, isError },
+      )
+      .render(100).join("\n").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  };
+
+  const summaryOf = (rendered) =>
+    rendered.split("\n").map((line) => line.trim()).find(Boolean) ?? "";
+
+  // Identical output text must render differently based only on Pi's flag.
+  const sameText = "Error: something this tool legitimately printed";
+  const asSuccess = renderBashResult(sameText, false);
+  const asFailure = renderBashResult(sameText, true);
+  assert.ok(summaryOf(asSuccess).includes("Done"), asSuccess);
+  assert.ok(!summaryOf(asSuccess).includes("Command failed"), asSuccess);
+  assert.ok(!summaryOf(asFailure).includes("Done"), asFailure);
 }
 
 // Third-party tools use their native renderer inside the same clean hierarchy,
@@ -719,11 +896,8 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   InteractiveMode.prototype.showExtensionNotify.call(notifyHost, "Default footer");
   InteractiveMode.prototype.showExtensionNotify.call(notifyHost, "Keep warning native", "warning");
   InteractiveMode.prototype.showExtensionNotify.call(notifyHost, "Keep error native", "error");
-  assert.deepEqual(nativeNotifications, [
-    ["warning", "Keep warning native"],
-    ["error", "Keep error native"],
-  ]);
-  assert.equal(infoComponents.length, 2);
+  assert.deepEqual(nativeNotifications, []);
+  assert.equal(infoComponents.length, 4);
   const customMessage = {
     role: "custom",
     timestamp: 12346,
@@ -742,7 +916,10 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   assert.ok(!collapsedThinkingText.includes("Footer info"));
   assert.equal(collapsedTool.length, 0);
   assert.equal(infoComponents[0].render(80).length, 0);
-  assert.equal(customComponent.render(80).length, 0);
+  const standaloneCustom = customComponent.render(80).join("\n")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  assert.ok(standaloneCustom.includes("Web Search Content Ready"));
+  assert.ok(standaloneCustom.includes("Content fetched for 2/3 URLs"));
   const wheelEvent = {
     type: "scroll", direction: "up", x: 1, y: 1, width: 80, height: collapsedThinking.length,
   };
@@ -764,7 +941,7 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   assert.ok(compactToolText.includes("├─") && compactToolText.includes("● Recall Observation"));
   assert.ok(compactToolText.includes("ok"));
   assert.ok(infoUpdateText.includes("◇ Footer info"));
-  assert.ok(customUpdate.includes("└─") && customUpdate.includes("Web Search Content Ready"));
+  assert.ok(!customUpdate.includes("└─") && customUpdate.includes("Web Search Content Ready"));
   assert.ok(customUpdate.includes("Content fetched for 2/3 URLs"));
   assert.ok(customUpdate.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").includes("└ Content fetched"));
   assert.ok(!/\x1b\[(?:4[0-9]|10[0-7]|48(?:;|:))/u.test(customUpdate));
@@ -822,6 +999,467 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     ];
     assert.ok(lines.every((line) => visibleWidth(line) <= width));
   }
+}
+
+// A failed attempt can leave its Thinking block outside its completed activity
+// group while an automatic retry places a different Thought inside the next
+// group. Failed-attempt thinking must retain timeline ownership instead of
+// becoming a standalone native block between the two groups.
+{
+  await emit("session_start", {}, sessionContext([]));
+  await emit("agent_start");
+  const failedAttemptThinking = "Implementing Markdown render helper\n\nAdding markdown cache invalidation";
+  const retryAttemptThinking = "Implementing Markdown component caching\n\nRefining Markdown rendering";
+  const firstAttempt = {
+    role: "assistant",
+    timestamp: 55_000,
+    content: [
+      { type: "thinking", thinking: failedAttemptThinking },
+      { type: "toolCall", id: "failed-attempt-tool", name: "edit", arguments: { path: "x.ts" } },
+    ],
+  };
+  await emit("message_update", { message: firstAttempt });
+  const failedThinking = new AssistantMessageComponent(firstAttempt);
+  const failedTool = new ToolExecutionComponent(
+    "edit",
+    "failed-attempt-tool",
+    { path: "x.ts" },
+    undefined,
+    { renderShell: "self", renderCall: () => new Text("edit x.ts", 0, 0) },
+    { requestRender() {} },
+    process.cwd(),
+  );
+  failedTool.markExecutionStarted();
+  const failedMessage = {
+    ...firstAttempt,
+    stopReason: "error",
+    errorMessage: "WebSocket error",
+  };
+  failedThinking.updateContent(failedMessage, false);
+  failedTool.updateResult({
+    content: [{ type: "text", text: "WebSocket error" }],
+    isError: true,
+  });
+  await emit("message_end", { message: failedMessage });
+  await emit("agent_settled");
+
+  await emit("agent_start");
+  const retryAttempt = {
+    role: "assistant",
+    timestamp: 56_000,
+    content: [
+      { type: "thinking", thinking: retryAttemptThinking },
+      { type: "toolCall", id: "retry-attempt-tool", name: "edit", arguments: { path: "x.ts" } },
+    ],
+  };
+  await emit("message_update", { message: retryAttempt });
+  const retryThinking = new AssistantMessageComponent(retryAttempt);
+  const retryTool = new ToolExecutionComponent(
+    "edit",
+    "retry-attempt-tool",
+    { path: "x.ts" },
+    undefined,
+    { renderShell: "self", renderCall: () => new Text("edit x.ts", 0, 0) },
+    { requestRender() {} },
+    process.cwd(),
+  );
+  retryTool.markExecutionStarted();
+  const retryCollapsed = retryThinking.render(80);
+  retryThinking.handleMouse({
+    type: "click", button: "left", x: 1, y: 1, width: 80, height: retryCollapsed.length,
+  });
+  retryThinking.handleMouse({
+    type: "click", button: "left", x: 8, y: 2, width: 80, height: retryThinking.render(80).length,
+  });
+
+  const failedRendered = [
+    ...failedThinking.render(80),
+    ...failedTool.render(80),
+  ].join("\n").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  const retryRendered = [
+    ...retryThinking.render(80),
+    ...retryTool.render(80),
+  ].join("\n").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  assert.ok(!failedRendered.includes("Implementing Markdown render helper"));
+  assert.ok(failedRendered.includes("Running("));
+  assert.ok(retryRendered.includes("Implementing Markdown component caching"));
+}
+
+// Pure assistant terminal states with no tool remain visible as unified
+// severity updates rather than falling back to Pi's unrelated native block.
+{
+  for (const fixture of [
+    { stopReason: "error", errorMessage: "Authentication failed", expected: "Error" },
+    { stopReason: "aborted", errorMessage: "Cancelled by operator", expected: "Operation aborted" },
+    { stopReason: "length", errorMessage: "", expected: "Response truncated" },
+  ]) {
+    await emit("session_start", {}, sessionContext([]));
+    const terminalMessage = {
+      role: "assistant",
+      timestamp: `terminal-${fixture.stopReason}`,
+      content: [],
+      stopReason: fixture.stopReason,
+      errorMessage: fixture.errorMessage,
+    };
+    await emit("message_end", { message: terminalMessage });
+    const terminalComponent = new AssistantMessageComponent(terminalMessage);
+    const terminalText = terminalComponent.render(80).join("\n")
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+    assert.ok(terminalText.includes(fixture.expected));
+    assert.ok(terminalText.includes(fixture.errorMessage || "Response was truncated before completion."));
+  }
+}
+
+// Repeated pure assistant failures and Pi's final retry failure remain five
+// standalone hard-boundary errors; they never form Updates/Failed groups.
+{
+  await emit("session_start", {}, sessionContext([]));
+  const retryErrorComponents = [];
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    const failedAttempt = {
+      role: "assistant",
+      timestamp: `network-error-${attempt}`,
+      content: [],
+      stopReason: "error",
+      errorMessage: "fetch failed",
+    };
+    await emit("message_end", { message: failedAttempt });
+    const component = new AssistantMessageComponent(failedAttempt);
+    component.render(80);
+    retryErrorComponents.push(component);
+  }
+  const runtimeErrorComponents = [];
+  InteractiveMode.prototype.showError.call({
+    ui: { requestRender() {} },
+    chatContainer: { addChild(component) { runtimeErrorComponents.push(component); } },
+  }, "Retry failed after 3 attempts: fetch failed");
+  const renderedErrors = [
+    ...retryErrorComponents.flatMap((component) => component.render(80)),
+    ...runtimeErrorComponents.flatMap((component) => component.render(80)),
+  ].join("\n").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  // Alerts stay standalone: each renders its own card, and no group-parent row
+  // (the `●` marker) appears for them. This fails if update-only folding or a
+  // parent-row projection is ever reintroduced.
+  assert.equal(renderedErrors.split("✕").length - 1, 5, renderedErrors);
+  assert.ok(!renderedErrors.includes("● "), renderedErrors);
+  assert.equal(renderedErrors.split("fetch failed").length - 1, 5, renderedErrors);
+  assert.ok(renderedErrors.includes("Retry failed after 3 attempts"));
+}
+
+// Regression: while the current group holds only a thought, a notification and
+// a renderer-less custom message still join that group. Both used to fall into
+// the tool-only refusal branch, which threw inside ctx.ui.notify and left the
+// custom message on Pi's native purple box.
+{
+  await emit("session_start", {}, sessionContext([]));
+  await emit("agent_start");
+  const thoughtOnlyMessage = {
+    role: "assistant",
+    timestamp: 58_000,
+    content: [{ type: "thinking", thinking: "Only a thought so far" }],
+  };
+  await emit("message_update", { message: thoughtOnlyMessage });
+  const thoughtOnlyThinking = new AssistantMessageComponent(thoughtOnlyMessage);
+  const thoughtOnlyChildren = [];
+  const thoughtOnlyHost = {
+    ui: { requestRender() {} },
+    chatContainer: { addChild(component) { thoughtOnlyChildren.push(component); } },
+  };
+  assert.doesNotThrow(() => {
+    InteractiveMode.prototype.showExtensionNotify.call(thoughtOnlyHost, "Indexing complete", "info");
+  });
+  assert.equal(thoughtOnlyChildren.length, 1);
+  const thoughtOnlyCustom = new CustomMessageComponent({
+    role: "custom",
+    timestamp: 58_100,
+    customType: "plugin-event",
+    content: "Renderer-less **markdown** payload",
+    display: true,
+  });
+  const renderThoughtOnly = () => [
+    ...thoughtOnlyThinking.render(80),
+    ...thoughtOnlyChildren.flatMap((component) => component.render(80)),
+    ...thoughtOnlyCustom.render(80),
+  ].join("\n").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+
+  // Collapsed: the tool-free turn still gets a parent row, and its members are
+  // hidden inside it exactly like tool members.
+  const collapsedThoughtOnly = renderThoughtOnly();
+  assert.ok(collapsedThoughtOnly.includes("Running(1 thought"), collapsedThoughtOnly);
+  assert.ok(!collapsedThoughtOnly.includes("Indexing complete"));
+  assert.ok(!collapsedThoughtOnly.includes("Plugin Event"));
+
+  thoughtOnlyThinking.handleMouse({
+    type: "click", button: "left", x: 1, y: 1, width: 80,
+    height: thoughtOnlyThinking.render(80).length,
+  });
+  const revealedThoughtOnly = renderThoughtOnly();
+  assert.ok(revealedThoughtOnly.includes("● thought"));
+  assert.ok(revealedThoughtOnly.includes("Indexing complete"), revealedThoughtOnly);
+  assert.ok(!revealedThoughtOnly.includes("[plugin-event]"), revealedThoughtOnly);
+  assert.ok(revealedThoughtOnly.includes("Plugin Event"));
+  assert.ok(revealedThoughtOnly.includes("Renderer-less"));
+  assert.ok(!revealedThoughtOnly.includes("**"));
+}
+
+// Regression: a turn that produces a thought and no tool call still gets the
+// unified parent row, with the Thought as its child. The native component no
+// longer holds the Thinking content, so this projection is the only renderer.
+{
+  await emit("session_start", {}, sessionContext([]));
+  await emit("agent_start");
+  const thinkingOnly = {
+    role: "assistant",
+    timestamp: 58_200,
+    stopReason: "toolUse",
+    content: [{ type: "thinking", thinking: "Thought that must survive" }],
+  };
+  await emit("message_update", { message: thinkingOnly });
+  const turnComponent = new AssistantMessageComponent(thinkingOnly);
+  const renderTurn = () => turnComponent.render(80).join("\n")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+
+  // Streaming a Thought with no tool yet is a live group, so it reads Running.
+  const runningTurn = renderTurn();
+  assert.ok(runningTurn.includes("● Running(1 thought)"), runningTurn);
+  assert.ok(!runningTurn.includes("tool call"));
+
+  // The same message then gains visible text and settles as Done.
+  const thoughtOnlyTurn = {
+    ...thinkingOnly,
+    stopReason: "stop",
+    content: [
+      { type: "thinking", thinking: "Thought that must survive" },
+      { type: "text", text: "Final answer text" },
+    ],
+  };
+  turnComponent.updateContent(thoughtOnlyTurn);
+  await emit("message_update", { message: thoughtOnlyTurn });
+  await emit("message_end", { message: thoughtOnlyTurn });
+  const doneTurn = renderTurn();
+  assert.ok(doneTurn.includes("● Done(1 thought)"), doneTurn);
+  assert.ok(doneTurn.includes("Final answer text"));
+  assert.ok(!doneTurn.includes("Thought that must survive"));
+
+  turnComponent.handleMouse({
+    type: "click", button: "left", x: 1, y: 1, width: 80, height: turnComponent.render(80).length,
+  });
+  const revealedTurn = renderTurn();
+  assert.ok(revealedTurn.includes("└─ ● thought"), revealedTurn);
+  assert.ok(revealedTurn.includes("Final answer text"));
+  assert.ok(!revealedTurn.includes("Thought that must survive"));
+
+  turnComponent.handleMouse({
+    type: "click", button: "left", x: 4, y: 2, width: 80, height: turnComponent.render(80).length,
+  });
+  const expandedTurn = renderTurn();
+  assert.ok(expandedTurn.includes("Thought that must survive"), expandedTurn);
+  assert.ok(expandedTurn.includes("Final answer text"));
+
+  // A thought with neither tool calls nor visible text must still render.
+  await emit("session_start", {}, sessionContext([]));
+  await emit("agent_start");
+  const bareThought = {
+    role: "assistant",
+    timestamp: 58_300,
+    stopReason: "stop",
+    content: [{ type: "thinking", thinking: "Bare thought" }],
+  };
+  const bareComponent = new AssistantMessageComponent(bareThought);
+  const bareText = bareComponent.render(80).join("\n")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  assert.ok(bareText.includes("● Running(1 thought)"), bareText);
+}
+
+
+// Clean mode owns thought disclosure. Ctrl+T is intercepted without changing
+// Pi's persisted hideThinkingBlock setting, while non-clean modes still use
+// Pi's original toggle implementation.
+{
+  widgets.clear();
+  await emit("session_start", {}, sessionContext([]));
+  await emit("agent_start");
+  const visibilityMessage = {
+    role: "assistant",
+    timestamp: 56_500,
+    content: [
+      { type: "thinking", thinking: "Individually expanded thought detail" },
+      { type: "toolCall", id: "visibility-tool", name: "edit", arguments: { path: "visible.ts" } },
+    ],
+  };
+  await emit("message_update", { message: visibilityMessage });
+  const visibilityThinking = new AssistantMessageComponent(visibilityMessage);
+  const visibilityTool = new ToolExecutionComponent(
+    "edit", "visibility-tool", { path: "visible.ts" }, undefined,
+    { renderShell: "self", renderCall: () => new Text("edit visible.ts", 0, 0) },
+    { requestRender() {} }, process.cwd(),
+  );
+  visibilityTool.markExecutionStarted();
+  visibilityThinking.handleMouse({
+    type: "click", button: "left", x: 1, y: 1, width: 80,
+    height: visibilityThinking.render(80).length,
+  });
+  const renderVisibilityThinking = () => visibilityThinking.render(80).join("\n")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+  const revealedThought = renderVisibilityThinking();
+  assert.ok(revealedThought.includes("● thought"), revealedThought);
+  assert.ok(!revealedThought.includes("Individually expanded thought detail"), revealedThought);
+
+  // Even a native visibility refresh with Pi's setting at "visible" must not
+  // bypass clean mode's per-thought disclosure.
+  InteractiveMode.prototype.updateThinkingBlockVisibility.call({
+    hideThinkingBlock: false,
+    chatContainer: { children: [visibilityThinking] },
+    ui: { requestRender() {} },
+  });
+  assert.ok(!renderVisibilityThinking().includes("Individually expanded thought detail"));
+
+  let settingWrites = 0;
+  let nativeVisibilityUpdates = 0;
+  const visibilityHost = {
+    hideThinkingBlock: false,
+    settingsManager: { setHideThinkingBlock() { settingWrites += 1; } },
+    updateThinkingBlockVisibility() { nativeVisibilityUpdates += 1; },
+    showStatus: InteractiveMode.prototype.showStatus,
+    ui: { requestRender() {} },
+  };
+  InteractiveMode.prototype.toggleThinkingBlockVisibility.call(visibilityHost);
+  assert.equal(visibilityHost.hideThinkingBlock, false);
+  assert.equal(settingWrites, 0);
+  assert.equal(nativeVisibilityUpdates, 0);
+  assert.ok(widgetText().includes("Thought details expand individually in clean mode"), widgetText());
+  assert.ok(!renderVisibilityThinking().includes("Individually expanded thought detail"));
+
+  visibilityThinking.handleMouse({
+    type: "click", button: "left", x: 4, y: 2, width: 80,
+    height: visibilityThinking.render(80).length,
+  });
+  assert.ok(renderVisibilityThinking().includes("Individually expanded thought detail"));
+
+  // Full/compact modes delegate to Pi unchanged, including persistence.
+  const commandContext = { hasUI: true, ui: { notify() {} } };
+  await commands.get("pretty-tui").handler("full", commandContext);
+  let nativeStatus = "";
+  visibilityHost.showStatus = (message) => { nativeStatus = message; };
+  InteractiveMode.prototype.toggleThinkingBlockVisibility.call(visibilityHost);
+  assert.equal(visibilityHost.hideThinkingBlock, true);
+  assert.equal(settingWrites, 1);
+  assert.equal(nativeVisibilityUpdates, 1);
+  assert.equal(nativeStatus, "Thinking blocks: hidden");
+  await commands.get("pretty-tui").handler("clean", commandContext);
+}
+
+// The editor-adjacent widget is a ten-second UI flash. Thinking, tools,
+// extension notifications, warnings, and errors never occupy it; direct Pi
+// showStatus calls replace one another without entering the transcript.
+{
+  widgets.clear();
+  await emit("session_start", {}, sessionContext([]));
+  await emit("agent_start");
+  const widgetMessage = {
+    role: "assistant",
+    timestamp: 57_000,
+    content: [
+      { type: "thinking", thinking: "Inspect widget lifecycle" },
+      { type: "toolCall", id: "widget-tool", name: "edit", arguments: { path: "widget.ts" } },
+    ],
+  };
+  // An empty reading must mean "no widget installed", not "installed but blank",
+  // otherwise these checks would pass even if the flash never worked.
+  const assertNoFlash = (label) => {
+    assert.equal(widgets.has("pretty-tui-latest-activity"), false, label);
+    assert.equal(widgetText(), "", label);
+  };
+  await emit("message_update", { message: widgetMessage });
+  assertNoFlash("thinking must not feed the flash");
+  await emit("tool_execution_start", {
+    toolCallId: "widget-tool", toolName: "edit", args: { path: "widget.ts" },
+  });
+  assertNoFlash("a running tool must not feed the flash");
+  await emit("tool_execution_end", {
+    toolCallId: "widget-tool",
+    toolName: "edit",
+    result: { content: [{ type: "text", text: "Edit failed" }] },
+    isError: true,
+  });
+  assertNoFlash("a failed tool must not feed the flash");
+  await emit("message_end", {
+    message: { ...widgetMessage, stopReason: "error", errorMessage: "WebSocket error" },
+  });
+  assertNoFlash("an assistant error must not feed the flash");
+
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const scheduled = [];
+  let timerId = 0;
+  globalThis.setTimeout = (callback, delay) => {
+    timerId += 1;
+    scheduled.push({ id: timerId, callback, delay });
+    return timerId;
+  };
+  globalThis.clearTimeout = () => {};
+  try {
+    const statusComponents = [];
+    const statusHost = {
+      ui: { requestRender() {} },
+      chatContainer: { addChild(component) { statusComponents.push(component); } },
+    };
+    InteractiveMode.prototype.showStatus.call(statusHost, "Thinking blocks: hidden");
+    InteractiveMode.prototype.showStatus.call(statusHost, "Thinking blocks: visible");
+    assert.equal(statusComponents.length, 0, "showStatus must stay out of the transcript");
+    assert.ok(widgetText().includes("Thinking blocks: visible"));
+    assert.ok(!widgetText().includes("Thinking blocks: hidden"));
+    assert.equal(scheduled.length, 2, "each status schedules its own expiry");
+    assert.equal(scheduled.at(-1).delay, 10_000);
+
+    // The superseded timer must not clear the newer status, which is the whole
+    // reason the widget tracks a generation.
+    scheduled[0].callback();
+    assert.ok(widgetText().includes("Thinking blocks: visible"), "a stale timer cleared a live status");
+
+    await emit("message_start", {
+      message: { role: "user", content: [{ type: "text", text: "next" }] },
+    });
+    assert.ok(widgetText().includes("Thinking blocks: visible"), "model work must not clear the flash");
+    scheduled.at(-1).callback();
+    assertNoFlash("the newest timer clears the flash");
+
+    InteractiveMode.prototype.showStatus.call(statusHost, "Reload status");
+    assert.ok(widgetText().includes("Reload status"));
+    await emit("session_start", {}, sessionContext([]));
+    assertNoFlash("session_start clears the flash");
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+}
+
+// Clean mode owns all runtime notification severities. Warning and error
+// updates retain distinct theme styling instead of falling back to Pi's native
+// chat lines.
+{
+  await emit("session_start", {}, sessionContext([]));
+  const nativeNotifications = [];
+  const components = [];
+  const host = {
+    ui: { requestRender() {} },
+    chatContainer: { addChild(component) { components.push(component); } },
+    showStatus(message) { nativeNotifications.push(["info", message]); },
+    showWarning(message) { nativeNotifications.push(["warning", message]); },
+    showError(message) { nativeNotifications.push(["error", message]); },
+  };
+  InteractiveMode.prototype.showExtensionNotify.call(host, "Rate limit approaching", "warning");
+  InteractiveMode.prototype.showExtensionNotify.call(host, "WebSocket failed", "error");
+  assert.deepEqual(nativeNotifications, []);
+  assert.equal(widgets.has("pretty-tui-latest-activity"), false);
+  const warningLines = components[0].render(80).join("\n");
+  const errorLines = components[1].render(80).join("\n");
+  assert.ok(warningLines.includes("Rate limit approaching"));
+  assert.ok(errorLines.includes("WebSocket failed"));
+  const warningColor = warningLines.match(/\x1b\[[0-9;]+m/)?.[0];
+  const errorColor = errorLines.match(/\x1b\[[0-9;]+m/)?.[0];
+  assert.ok(warningColor && errorColor);
+  assert.notEqual(warningColor, errorColor);
 }
 
 // Fullscreen Markdown shows per-block Copy controls with precise hit regions;
@@ -1086,8 +1724,36 @@ const patchedAssistantMouse = AssistantMessageComponent.prototype.handleMouse;
 const patchedCustomMessageRender = CustomMessageComponent.prototype.render;
 const patchedToolRender = ToolExecutionComponent.prototype.render;
 const patchedShowExtensionNotify = InteractiveMode.prototype.showExtensionNotify;
+// Every patch key must be present while the extension is active, so the
+// post-shutdown check below cannot pass by testing keys that were never set.
+for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
+  assert.notEqual(key.owner[key.symbol], undefined, `${key.label} patch key was never installed`);
+}
+
+// session_shutdown must also drop the transient UI flash and its timer.
+InteractiveMode.prototype.showStatus.call(
+  {
+    ui: { requestRender() {} },
+    chatContainer: { addChild() {} },
+  },
+  "Shutdown status",
+);
+assert.equal(widgets.has("pretty-tui-latest-activity"), true);
 await emit("session_shutdown");
+assert.equal(widgets.has("pretty-tui-latest-activity"), false, "session_shutdown left the flash installed");
 assert.equal(Markdown.prototype.handleMouse, undefined);
+
+// Reload and /pretty-tui disable both rely on session_shutdown putting every
+// patched method back. Compare against snapshots taken before the extension was
+// loaded instead of merely asserting "something changed", and cover every
+// patched method rather than a sample: a partial restore leaves pretty-tui
+// active after it reports itself disabled.
+for (const [label, target, method, original] of originalPrototypeMethods) {
+  assert.equal(target[method], original, `${label} was not restored`);
+}
+for (const key of [...protoPatchKeys, ...symbolPatchKeys]) {
+  assert.equal(key.owner[key.symbol], undefined, `${key.label} patch key survived`);
+}
 assert.notEqual(Markdown.prototype.renderToken, patchedMarkdownRenderToken);
 assert.notEqual(AssistantMessageComponent.prototype.render, patchedAssistantRender);
 assert.notEqual(AssistantMessageComponent.prototype.handleMouse, patchedAssistantMouse);

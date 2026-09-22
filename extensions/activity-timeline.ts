@@ -1,4 +1,5 @@
 export type ActivityMemberKind = "tool" | "thinking" | "update";
+export type ActivitySeverity = "info" | "warning" | "error";
 
 export type ActivityMember = {
   id: string;
@@ -10,6 +11,7 @@ export type ActivityMember = {
   updateKey?: string;
   updateTitle?: string;
   updateContent?: string;
+  updateSeverity?: ActivitySeverity;
   persistent?: boolean;
 };
 
@@ -18,6 +20,7 @@ export type ActivityGroup = {
   members: ActivityMember[];
   toolCallIds: string[];
   thoughtCount: number;
+  hardBoundarySplit?: boolean;
 };
 
 const toolMemberId = (toolCallId: string) => `tool:${toolCallId}`;
@@ -35,6 +38,7 @@ export class ActivityTimeline {
   private toolMembers = new Map<string, string>();
   private thinkingMembers = new Map<string, string>();
   private updateMembers = new Map<string, string>();
+  private settledGroups = new Set<string>();
   private currentGroupId?: string;
   private sequence = 0;
 
@@ -45,12 +49,23 @@ export class ActivityTimeline {
     this.toolMembers.clear();
     this.thinkingMembers.clear();
     this.updateMembers.clear();
+    this.settledGroups.clear();
     this.currentGroupId = undefined;
     this.sequence = 0;
   }
 
-  boundary(): void {
+  /**
+   * Ends the current group. Because every hard transcript boundary routes here,
+   * a closed group can never receive further members, which makes this the
+   * completion signal for groups that have no durable tool summary.
+   */
+  boundary(settled = true): void {
+    if (settled && this.currentGroupId) this.settledGroups.add(this.currentGroupId);
     this.currentGroupId = undefined;
+  }
+
+  isSettled(groupId: string): boolean {
+    return this.settledGroups.has(groupId);
   }
 
   private ensureCurrentGroup(): ActivityGroup {
@@ -117,9 +132,10 @@ export class ActivityTimeline {
     title: string,
     content: string,
     persistent: boolean,
+    severity: ActivitySeverity = "info",
   ): ActivityMember | undefined {
     if (!this.currentGroupId) return undefined;
-    return this.addUpdateToGroup(this.currentGroupId, updateKey, title, content, persistent);
+    return this.addUpdateToGroup(this.currentGroupId, updateKey, title, content, persistent, severity);
   }
 
   addPendingUpdate(
@@ -127,25 +143,23 @@ export class ActivityTimeline {
     title: string,
     content: string,
     persistent: boolean,
+    severity: ActivitySeverity = "info",
   ): ActivityMember {
     const existingId = this.updateMembers.get(updateKey);
     if (existingId) return this.member(existingId)!;
     const group = this.ensureCurrentGroup();
-    return this.appendUpdate(group, updateKey, title, content, persistent);
+    return this.appendUpdate(group, updateKey, title, content, persistent, severity);
   }
 
-  addUpdateToGroupStart(
-    groupId: string,
-    updateKey: string,
-    title: string,
-    content: string,
-    persistent: boolean,
-  ): ActivityMember | undefined {
-    const existingId = this.updateMembers.get(updateKey);
-    if (existingId) return this.member(existingId);
-    const group = this.groupsById.get(groupId);
-    if (!group || group.toolCallIds.length === 0) return undefined;
-    return this.appendUpdate(group, updateKey, title, content, persistent, true);
+  /**
+   * A group can receive update members only once it holds real work. This is
+   * the single definition of that condition: thinking counts even before any
+   * tool has run, because an activity group is created by the first thought.
+   */
+  hasWork(group: ActivityGroup | undefined): boolean {
+    return Boolean(group?.members.some(
+      (member) => member.kind === "tool" || member.kind === "thinking",
+    ));
   }
 
   addUpdateToGroup(
@@ -154,12 +168,13 @@ export class ActivityTimeline {
     title: string,
     content: string,
     persistent: boolean,
+    severity: ActivitySeverity = "info",
   ): ActivityMember | undefined {
     const existingId = this.updateMembers.get(updateKey);
     if (existingId) return this.member(existingId);
     const group = this.groupsById.get(groupId);
-    if (!group || group.toolCallIds.length === 0) return undefined;
-    return this.appendUpdate(group, updateKey, title, content, persistent);
+    if (!this.hasWork(group)) return undefined;
+    return this.appendUpdate(group!, updateKey, title, content, persistent, severity);
   }
 
   private appendUpdate(
@@ -168,7 +183,7 @@ export class ActivityTimeline {
     title: string,
     content: string,
     persistent: boolean,
-    atStart = false,
+    severity: ActivitySeverity = "info",
   ): ActivityMember {
     const member: ActivityMember = {
       id: updateMemberId(updateKey),
@@ -176,10 +191,10 @@ export class ActivityTimeline {
       updateKey,
       updateTitle: title.trim() || "Update",
       updateContent: content.trim(),
+      updateSeverity: severity,
       persistent,
     };
-    if (atStart) group.members.unshift(member);
-    else group.members.push(member);
+    group.members.push(member);
     this.membersById.set(member.id, member);
     this.memberGroups.set(member.id, group.id);
     this.updateMembers.set(updateKey, member.id);
@@ -222,14 +237,53 @@ export class ActivityTimeline {
     return memberId ? this.member(memberId) : undefined;
   }
 
+  /**
+   * Releases a claimed update and splits the group at that point, so a native
+   * custom renderer can take the message over without the remaining members
+   * being reordered around it.
+   */
   removeUpdate(updateKey: string): boolean {
     const memberId = this.updateMembers.get(updateKey);
-    if (!memberId) return false;
+    if (!memberId) {
+      this.boundary();
+      return false;
+    }
     const groupId = this.memberGroups.get(memberId);
     const group = groupId ? this.groupsById.get(groupId) : undefined;
     if (group) {
       const index = group.members.findIndex((member) => member.id === memberId);
-      if (index >= 0) group.members.splice(index, 1);
+      if (index >= 0) {
+        const following = group.members.slice(index + 1);
+        group.members = group.members.slice(0, index);
+        group.hardBoundarySplit = true;
+        group.toolCallIds = group.members
+          .filter((member) => member.kind === "tool" && member.toolCallId)
+          .map((member) => member.toolCallId!);
+        group.thoughtCount = group.members.filter((member) => member.kind === "thinking").length;
+
+        if (following.length > 0) {
+          const nextId = `activity:${++this.sequence}`;
+          const next: ActivityGroup = {
+            id: nextId,
+            members: following,
+            toolCallIds: following
+              .filter((member) => member.kind === "tool" && member.toolCallId)
+              .map((member) => member.toolCallId!),
+            thoughtCount: following.filter((member) => member.kind === "thinking").length,
+            hardBoundarySplit: true,
+          };
+          const ordered = new Map<string, ActivityGroup>();
+          for (const [id, existing] of this.groupsById) {
+            ordered.set(id, existing);
+            if (id === group.id) ordered.set(next.id, next);
+          }
+          this.groupsById = ordered;
+          for (const member of following) this.memberGroups.set(member.id, next.id);
+          if (this.currentGroupId === group.id) this.currentGroupId = next.id;
+        } else if (this.currentGroupId === group.id) {
+          this.currentGroupId = undefined;
+        }
+      }
       if (group.members.length === 0) {
         this.groupsById.delete(group.id);
         if (this.currentGroupId === group.id) this.currentGroupId = undefined;
@@ -282,5 +336,5 @@ export const visibleAssistantText = (message: any): boolean =>
       (item: any) => item?.type === "text" && typeof item.text === "string" && item.text.trim().length > 0,
     );
 
-export const assistantSystemBoundary = (message: any): boolean =>
+export const assistantTerminalState = (message: any): boolean =>
   message?.role === "assistant" && ["error", "aborted", "length"].includes(message?.stopReason);

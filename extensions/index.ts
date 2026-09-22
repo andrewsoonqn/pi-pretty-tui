@@ -32,15 +32,17 @@ import { join } from "node:path";
 import {
   ActivityTimeline,
   assistantMessageKey,
-  assistantSystemBoundary,
+  assistantTerminalState,
   thinkingText,
   visibleAssistantText,
   type ActivityGroup,
   type ActivityMember,
+  type ActivitySeverity,
 } from "./activity-timeline.js";
 
 type PrettyTuiMode = "full" | "compact" | "clean";
 const CLEAN_TOOL_ACTIVITY_MIN_MS = 1000;
+const TRANSIENT_UI_STATUS_MS = 10_000;
 const SPECIALIZED_TOOL_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 
 const stripAnsiBackgrounds = (value: string): string =>
@@ -95,14 +97,88 @@ export default function prettyTui(pi: ExtensionAPI) {
   let currentTui: any;
   let currentExtensionUi: any;
   let changingAllToolsExpansion = false;
+  const latestActivityWidgetKey = "pretty-tui-latest-activity";
+  type LatestActivityStatus = {
+    title: string;
+    detail?: string;
+    severity?: TransientStatusSeverity;
+  };
+  // The editor-adjacent flash reports Pi UI state ("status") and pretty-tui's
+  // own UI outcomes, so it has its own severities. Activity members only ever
+  // carry info, warning, or error.
+  type TransientStatusSeverity = "status" | "success" | "error";
+  let latestActivityStatus: LatestActivityStatus | undefined;
+  let latestActivityWidgetInstalled = false;
+  let latestActivityStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  let latestActivityStatusGeneration = 0;
+  const renderLatestActivityStatus = (status: LatestActivityStatus, width: number, theme: any): string => {
+    const severity = status.severity ?? "status";
+    const icon = severity === "error" ? "✕" : severity === "success" ? "✓" : "◇";
+    const color = severity === "error"
+      ? "error"
+      : severity === "success"
+        ? "success"
+        : "dim";
+    const detail = status.detail?.trim() ? ` — ${status.detail.trim()}` : "";
+    return truncateToWidth(` ${theme.fg(color, `${icon} ${status.title}`)}${theme.fg("dim", detail)}`, Math.max(1, width), "…");
+  };
+  const refreshLatestActivityWidget = () => {
+    if (!currentExtensionUi?.setWidget) return;
+    if (renderMode !== "clean" || !latestActivityStatus) {
+      if (latestActivityWidgetInstalled) {
+        currentExtensionUi.setWidget(latestActivityWidgetKey, undefined);
+        latestActivityWidgetInstalled = false;
+      }
+      return;
+    }
+    if (latestActivityWidgetInstalled) {
+      currentTui?.requestRender?.();
+      return;
+    }
+    currentExtensionUi.setWidget(
+      latestActivityWidgetKey,
+      (_tui: any, theme: any) => ({
+        render: (width: number) => latestActivityStatus
+          ? [renderLatestActivityStatus(latestActivityStatus, width, theme)]
+          : [],
+        invalidate() {},
+      }),
+      { placement: "aboveEditor" },
+    );
+    latestActivityWidgetInstalled = true;
+  };
+  const clearLatestActivityStatus = () => {
+    latestActivityStatusGeneration++;
+    if (latestActivityStatusTimer) clearTimeout(latestActivityStatusTimer);
+    latestActivityStatusTimer = undefined;
+    latestActivityStatus = undefined;
+    if (latestActivityWidgetInstalled) {
+      currentExtensionUi?.setWidget?.(latestActivityWidgetKey, undefined);
+      latestActivityWidgetInstalled = false;
+    }
+  };
+  const setLatestActivityStatus = (status: LatestActivityStatus) => {
+    const generation = ++latestActivityStatusGeneration;
+    if (latestActivityStatusTimer) clearTimeout(latestActivityStatusTimer);
+    latestActivityStatus = status;
+    refreshLatestActivityWidget();
+    latestActivityStatusTimer = setTimeout(() => {
+      if (generation !== latestActivityStatusGeneration) return;
+      clearLatestActivityStatus();
+      currentTui?.requestRender?.();
+    }, TRANSIENT_UI_STATUS_MS);
+  };
   const activityTimeline = new ActivityTimeline();
   const revealedActivityGroups = new Set<string>();
   const expandedThinkingMembers = new Set<string>();
   const thinkingComponents = new Map<string, any>();
   const activityFallbackThemes = new Map<string, any>();
   const activityUpdateComponents = new Map<string, Component>();
-  const customUpdateToolHints = new Map<string, string>();
-  const customUpdateBeforeToolHints = new Set<string>();
+  const activityUpdateMarkdownComponents = new Map<string, {
+    content: string;
+    theme: any;
+    component: Markdown;
+  }>();
   let activityUpdateSequence = 0;
   const assistantBoundaryKeys = new Set<string>();
   const cleanCompactToolCallIds = new Set<string>();
@@ -112,6 +188,20 @@ export default function prettyTui(pi: ExtensionAPI) {
   const cleanToolThemes = new Map<string, any>();
   const cleanToolNames = new Map<string, string>();
   let renderCleanGroupSummary = (_lastToolCallId: string, _width: number): string[] => [];
+
+  // Markdown enhancements are active only while pi-pretty-tui renders the main
+  // conversation transcript. Plugin overlays also use Pi's Markdown class, so
+  // a global always-on prototype patch would leak transcript styling into them.
+  let transcriptMarkdownDepth = 0;
+  const withTranscriptMarkdown = <T>(callback: () => T): T => {
+    transcriptMarkdownDepth++;
+    try {
+      return callback();
+    } finally {
+      transcriptMarkdownDepth--;
+    }
+  };
+  const transcriptMarkdownActive = () => transcriptMarkdownDepth > 0;
 
   const setCleanGroupMembers = (lastToolCallId: string, toolCallIds: string[]) => {
     cleanGroupToolCallIds.set(lastToolCallId, toolCallIds);
@@ -167,11 +257,17 @@ export default function prettyTui(pi: ExtensionAPI) {
   };
 
   const defaultActivityTheme = () => {
+    if (currentExtensionUi?.theme?.fg) return currentExtensionUi.theme;
     const markdownTheme = getMarkdownTheme();
     return {
       fg: (color: string, text: string) => {
         if (color === "accent") return markdownTheme.listBullet(text);
-        if (color === "success" || color === "syntaxComment") return markdownTheme.codeBlock(text);
+        // Session UI normally supplies Pi's active Theme above. Keep portable
+        // semantic fallbacks for early startup and isolated renderer tests.
+        if (color === "warning") return `\x1b[33m${text}\x1b[39m`;
+        if (color === "error") return `\x1b[31m${text}\x1b[39m`;
+        if (color === "success") return `\x1b[32m${text}\x1b[39m`;
+        if (color === "syntaxComment") return markdownTheme.codeBlock(text);
         if (color === "thinkingLow") return markdownTheme.link(text);
         if (color === "dim" || color === "muted" || color === "thinkingText") {
           return markdownTheme.quote(text);
@@ -203,6 +299,12 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const activityGroupRevealed = (group: ActivityGroup): boolean =>
     cleanToolsExpanded || revealedActivityGroups.has(group.id);
+
+  // A group is revealable once it owns anything renderable beneath its parent
+  // row. Thinking counts on its own: a tool-free turn still gets a parent row
+  // with its Thought as the child member.
+  const activityGroupCollapsible = (group: ActivityGroup): boolean =>
+    activityTimeline.hasWork(group);
 
   const activityMemberPosition = (group: ActivityGroup, member: ActivityMember) => ({
     first: group.members[0]?.id === member.id,
@@ -238,6 +340,50 @@ export default function prettyTui(pi: ExtensionAPI) {
       .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
       .join(" ") || "Update";
 
+  const renderActivityUpdateMarkdown = (
+    member: ActivityMember,
+    width: number,
+    theme: any,
+  ): string[] => {
+    const content = member.updateContent ?? "";
+    if (!content) return [];
+    let cached = activityUpdateMarkdownComponents.get(member.id);
+    if (!cached || cached.content !== content || cached.theme !== theme) {
+      cached = {
+        content,
+        theme,
+        component: new Markdown(
+          content,
+          0,
+          0,
+          getMarkdownTheme(),
+          { color: (text: string) => theme.fg("muted", text) },
+        ),
+      };
+      activityUpdateMarkdownComponents.set(member.id, cached);
+    }
+    const lines = withTranscriptMarkdown(() => cached.component.render(Math.max(1, width)));
+    while (lines.length > 0 && stripTerminalSequences(lines[lines.length - 1]).trim() === "") {
+      lines.pop();
+    }
+    return lines;
+  };
+
+  const activityUpdateStyle = (member: ActivityMember, theme: any) => {
+    const severity = member.updateSeverity ?? "info";
+    const styles: Record<ActivitySeverity, { icon: string; color: string }> = {
+      info: { icon: "◇", color: "accent" },
+      warning: { icon: "⚠", color: "warning" },
+      error: { icon: "✕", color: "error" },
+    };
+    const style = styles[severity];
+    return {
+      severity,
+      icon: theme.fg(style.color, `${style.icon} `),
+      title: (text: string) => theme.fg(style.color, theme.bold(text)),
+    };
+  };
+
   const renderActivityUpdate = (
     group: ActivityGroup,
     member: ActivityMember,
@@ -247,10 +393,11 @@ export default function prettyTui(pi: ExtensionAPI) {
     if (renderMode !== "clean" || !activityGroupRevealed(group)) return [];
     const { prefix, continuation, childWidth } = activityTreeStyle(group, member, width, theme);
     const title = truncateToWidth(member.updateTitle ?? "Update", Math.max(1, childWidth - 2), "…");
-    const lines = [theme.fg("accent", "◇ ") + theme.fg("toolTitle", theme.bold(title))];
+    const style = activityUpdateStyle(member, theme);
+    const lines = [style.icon + style.title(title)];
     if (member.updateContent) {
       const detailWidth = Math.max(1, childWidth - visibleWidth("  │ "));
-      const detailLines = wrapTextWithAnsi(theme.fg("muted", member.updateContent), detailWidth);
+      const detailLines = renderActivityUpdateMarkdown(member, detailWidth, theme);
       lines.push(...detailLines.map((line, index) =>
         theme.fg("dim", index === detailLines.length - 1 ? "  └ " : "  │ ") + line
       ));
@@ -267,15 +414,31 @@ export default function prettyTui(pi: ExtensionAPI) {
   const renderPendingActivityUpdate = (member: ActivityMember, width: number): string[] => {
     const theme = defaultActivityTheme();
     const title = truncateToWidth(member.updateTitle ?? "Update", Math.max(1, width - 2), "…");
-    const lines = [theme.fg("accent", "◇ ") + theme.fg("toolTitle", theme.bold(title))];
+    const style = activityUpdateStyle(member, theme);
+    const lines = [style.icon + style.title(title)];
     if (member.updateContent) {
       const detailWidth = Math.max(1, width - visibleWidth("  │ "));
-      const details = wrapTextWithAnsi(theme.fg("muted", member.updateContent), detailWidth);
+      const details = renderActivityUpdateMarkdown(member, detailWidth, theme);
       lines.push(...details.map((line, index) =>
         theme.fg("dim", index === details.length - 1 ? "  └ " : "  │ ") + line
       ));
     }
     return ["", ...lines.map((line) => truncateToWidth(line, Math.max(1, width), ""))];
+  };
+
+  const renderActivityUpdateProjection = (
+    group: ActivityGroup,
+    member: ActivityMember,
+    width: number,
+  ): string[] => {
+    if (!activityGroupCollapsible(group)) return renderPendingActivityUpdate(member, width);
+    const position = activityMemberPosition(group, member);
+    if (!activityGroupRevealed(group)) {
+      return position.first
+        ? ["", ...renderActivityGroupSummary(group, width, true)]
+        : [];
+    }
+    return renderActivityUpdate(group, member, width);
   };
 
   const handleActivityUpdateMouse = (
@@ -284,7 +447,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     event: any,
   ) => {
     const isLeftClick = event.type === "click" && event.button === "left";
-    if (!isLeftClick || group.toolCallIds.length === 0) return undefined;
+    if (!isLeftClick || !activityGroupCollapsible(group)) return undefined;
     const position = activityMemberPosition(group, member);
     if (!activityGroupRevealed(group)) {
       if (!position.first) return undefined;
@@ -306,6 +469,8 @@ export default function prettyTui(pi: ExtensionAPI) {
         cleanToolComponents.get(child.toolCallId)?.updateDisplay?.();
       } else if (child.kind === "thinking" && child.messageKey) {
         thinkingComponents.get(child.messageKey)?.invalidate?.();
+      } else if (child.kind === "update") {
+        activityUpdateComponents.get(child.id)?.invalidate?.();
       }
     }
     currentTui?.requestRender?.();
@@ -399,6 +564,8 @@ export default function prettyTui(pi: ExtensionAPI) {
       revealedActivityGroups.clear();
       expandedThinkingMembers.clear();
       renderMode = requested;
+      if (renderMode === "clean") refreshLatestActivityWidget();
+      else clearLatestActivityStatus();
       for (const component of cleanToolComponents.values()) component.updateDisplay?.();
       for (const component of thinkingComponents.values()) component.invalidate?.();
       try {
@@ -414,20 +581,6 @@ export default function prettyTui(pi: ExtensionAPI) {
   // Keep the settings command available while disabled, but do not install
   // render patches or override built-in tools until the next enabled reload.
   if (!activeForSession) return;
-
-  // Markdown enhancements are active only while pi-pretty-tui renders the main
-  // conversation transcript. Plugin overlays also use Pi's Markdown class, so
-  // a global always-on prototype patch would leak transcript styling into them.
-  let transcriptMarkdownDepth = 0;
-  const withTranscriptMarkdown = <T>(callback: () => T): T => {
-    transcriptMarkdownDepth++;
-    try {
-      return callback();
-    } finally {
-      transcriptMarkdownDepth--;
-    }
-  };
-  const transcriptMarkdownActive = () => transcriptMarkdownDepth > 0;
 
   // Give Pi's main prompt editor a complete rounded frame. Render the native
   // editor at a two-column narrower width so cursor layout, wrapping, IME, and
@@ -615,14 +768,31 @@ export default function prettyTui(pi: ExtensionAPI) {
           .join("\n")
         : "";
 
+  // Delegates to the timeline so the precondition is stated once. The `??` is
+  // deliberate: the callee may still decline, and a dropped notification must
+  // never throw inside a third-party extension's ctx.ui.notify() call.
+  const hasWorkActivity = (group: ActivityGroup | undefined): boolean =>
+    activityTimeline.hasWork(group);
+
   const addPersistentActivityUpdate = (message: any): ActivityMember => {
     const key = customMessageKey(message);
     const title = humanizeCustomType(message?.customType ?? "update");
     const content = customMessageText(message);
-    return activityTimeline.addUpdate(key, title, content, true) ??
-      activityTimeline.addPendingUpdate(key, title, content, true);
+    const existingGroup = activityTimeline.currentGroup();
+    const joinsWork = hasWorkActivity(existingGroup);
+    const member = joinsWork
+      ? activityTimeline.addUpdate(key, title, content, true, "info") ??
+        activityTimeline.addPendingUpdate(key, title, content, true, "info")
+      : activityTimeline.addPendingUpdate(key, title, content, true, "info");
+    // A displayed custom message without current model/tool work is an
+    // independent durable update, never a pending member of the next run.
+    if (!hasWorkActivity(existingGroup)) activityTimeline.boundary();
+    return member;
   };
 
+  const nativeCustomBoundaryKeys = new Set<string>();
+  let closeCleanAtNativeCustomBoundary = () => activityTimeline.boundary();
+  let closeCleanAtStandaloneAlert = () => activityTimeline.boundary();
   const customMessagePrototype = CustomMessageComponent.prototype as any;
   const customMessagePatchKey = Symbol.for("pretty-tui.clean-custom-message");
   if (!customMessagePrototype[customMessagePatchKey]) {
@@ -631,9 +801,13 @@ export default function prettyTui(pi: ExtensionAPI) {
     const releaseSemanticCustomMessage = (component: any): boolean => {
       if (!component.customRenderer) return false;
       const key = customMessageKey(component.message);
-      const member = activityTimeline.memberForUpdate(key);
-      if (member) activityUpdateComponents.delete(member.id);
-      activityTimeline.removeUpdate(key);
+      if (!nativeCustomBoundaryKeys.has(key)) {
+        nativeCustomBoundaryKeys.add(key);
+        const member = activityTimeline.memberForUpdate(key);
+        if (member) activityUpdateComponents.delete(member.id);
+        activityTimeline.removeUpdate(key);
+        closeCleanAtNativeCustomBoundary();
+      }
       return true;
     };
     const patchedCustomRender = function (this: any, width: number): string[] {
@@ -643,37 +817,19 @@ export default function prettyTui(pi: ExtensionAPI) {
       const message = this.message;
       const key = customMessageKey(message);
       let member = activityTimeline.memberForUpdate(key);
-      if (!member) {
-        const hintedToolCallId = customUpdateToolHints.get(key);
-        const hintedGroup = hintedToolCallId
-          ? activityTimeline.groupForTool(hintedToolCallId)
-          : undefined;
-        if (hintedGroup) {
-          const attach = customUpdateBeforeToolHints.has(key)
-            ? activityTimeline.addUpdateToGroupStart.bind(activityTimeline)
-            : activityTimeline.addUpdateToGroup.bind(activityTimeline);
-          member = attach(
-            hintedGroup.id,
-            key,
-            humanizeCustomType(message?.customType ?? "update"),
-            customMessageText(message),
-            true,
-          );
-        }
+      // Extension-injected custom messages do not always emit Pi's model
+      // message_start event. Claim them at the component boundary so live
+      // rendering matches transcript restoration instead of failing open to
+      // the purple native box until the next reload.
+      if (!member && renderMode === "clean") {
+        member = addPersistentActivityUpdate(message);
       }
       const group = member ? activityTimeline.groupForMember(member.id) : undefined;
       if (renderMode !== "clean" || !member || !group) {
         return originalCustomRender.call(this, width);
       }
       activityUpdateComponents.set(member.id, this);
-      if (group.toolCallIds.length === 0) return renderPendingActivityUpdate(member, width);
-      const position = activityMemberPosition(group, member);
-      if (!activityGroupRevealed(group)) {
-        return position.first
-          ? ["", ...renderActivityGroupSummary(group, width, true)]
-          : [];
-      }
-      return renderActivityUpdate(group, member, width);
+      return renderActivityUpdateProjection(group, member, width);
     };
     const patchedCustomHandleMouse = function (this: any, event: any) {
       if (releaseSemanticCustomMessage(this)) {
@@ -684,7 +840,6 @@ export default function prettyTui(pi: ExtensionAPI) {
       if (renderMode !== "clean" || !member || !group) {
         return originalCustomHandleMouse?.call(this, event);
       }
-      if (group.toolCallIds.length === 0) return undefined;
       return handleActivityUpdateMouse(group, member, event);
     };
     customMessagePrototype[customMessagePatchKey] = {
@@ -728,14 +883,38 @@ export default function prettyTui(pi: ExtensionAPI) {
     const cleanThinkingRenderCacheKey = Symbol("pretty-tui.clean-thinking-render-cache");
     const cleanThinkingDetailKey = Symbol("pretty-tui.clean-thinking-detail");
 
+    const assistantTerminalUpdate = (message: any): ActivityMember | undefined => {
+      if (!assistantTerminalState(message)) return undefined;
+      const hasToolCalls = Array.isArray(message?.content) &&
+        message.content.some((item: any) => item?.type === "toolCall");
+      // Failed tools already preserve the error in their native result details;
+      // avoid duplicating that payload as a second durable member.
+      if (hasToolCalls) return undefined;
+      const key = `assistant-terminal:${assistantMessageKey(message)}`;
+      const existing = activityTimeline.memberForUpdate(key);
+      if (existing) return existing;
+      const stopReason = message?.stopReason;
+      const severity: ActivitySeverity = stopReason === "aborted" ? "warning" : "error";
+      const title = stopReason === "length"
+        ? "Response truncated"
+        : stopReason === "aborted"
+          ? "Operation aborted"
+          : "Error";
+      const content = String(message?.errorMessage ?? "").trim() ||
+        (stopReason === "length" ? "Response was truncated before completion." : "Unknown error");
+      activityTimeline.boundary();
+      const member = activityTimeline.addPendingUpdate(key, title, content, true, severity);
+      activityTimeline.boundary();
+      return member;
+    };
+
     const eligibleThinking = (message: any) =>
       Array.isArray(message?.content) &&
       message.content.some(
         (item: any) => item?.type === "thinking" &&
           typeof item.thinking === "string" &&
           item.thinking.length > 0,
-      ) &&
-      !assistantSystemBoundary(message);
+      );
 
     const refreshGroup = (group: ActivityGroup) => {
       for (const member of group.members) {
@@ -743,9 +922,39 @@ export default function prettyTui(pi: ExtensionAPI) {
           cleanToolComponents.get(member.toolCallId)?.updateDisplay?.();
         } else if (member.kind === "thinking" && member.messageKey) {
           thinkingComponents.get(member.messageKey)?.invalidate?.();
+        } else if (member.kind === "update") {
+          activityUpdateComponents.get(member.id)?.invalidate?.();
         }
       }
       currentTui?.requestRender?.();
+    };
+
+    // Shared detail projection for a Thought, used both as a member of a tool
+    // group and as a standalone row. The cache records its theme because the
+    // same component can switch between the Markdown fallback and a real tool
+    // theme once the first tool of the group is constructed.
+    const thinkingDetailLines = (
+      owner: any,
+      text: string,
+      theme: any,
+      childWidth: number,
+    ): string[] => {
+      let detail = owner[cleanThinkingDetailKey];
+      if (!detail || detail.text !== text || detail.theme !== theme) {
+        detail = {
+          text,
+          theme,
+          component: new Markdown(text, 0, 0, owner.markdownTheme, {
+            color: (line: string) => theme.fg("thinkingText", line),
+            italic: true,
+          }),
+        };
+        owner[cleanThinkingDetailKey] = detail;
+      }
+      const lines: string[] = detail.component.render(Math.max(1, childWidth));
+      return lines.map((line, index) =>
+        theme.fg("dim", index === lines.length - 1 ? "  └ " : "  │ ") + line
+      );
     };
 
     const patchedUpdateContent = function (this: any, message: any, isStreaming = this.isStreaming) {
@@ -790,8 +999,14 @@ export default function prettyTui(pi: ExtensionAPI) {
       ) {
         patchedUpdateContent.call(this, message, this.isStreaming);
       }
-      if (renderMode !== "clean" || !eligibleThinking(message)) {
-        return originalRender.call(this, width);
+      if (renderMode !== "clean") return originalRender.call(this, width);
+      const terminalMember = assistantTerminalUpdate(message);
+      if (!eligibleThinking(message)) {
+        if (!terminalMember) return originalRender.call(this, width);
+        const terminalGroup = activityTimeline.groupForMember(terminalMember.id);
+        if (!terminalGroup) return originalRender.call(this, width);
+        activityUpdateComponents.set(terminalMember.id, this);
+        return renderActivityUpdateProjection(terminalGroup, terminalMember, width);
       }
 
       const key = assistantMessageKey(message);
@@ -803,25 +1018,29 @@ export default function prettyTui(pi: ExtensionAPI) {
         // assistant text is never lost.
         return originalRender.call(this, width);
       }
-      if (group.toolCallIds.length === 0) {
-        // Activity groups are tool-oriented. A model may finish with Thinking
-        // and visible text without calling a tool; only the Thinking portion
-        // is filtered from Pi's native component, so always preserve the
-        // visible response here instead of returning an empty projection.
-        return visibleAssistantText(message) ? originalRender.call(this, width) : [];
-      }
       thinkingComponents.set(key, this);
       if (!activityFallbackThemes.has(group.id)) {
         activityFallbackThemes.set(group.id, defaultActivityTheme());
       }
       const position = activityMemberPosition(group, member);
       const visibleLines = visibleAssistantText(message) ? originalRender.call(this, width) : [];
+      // Pi's native renderer prints its own error line for messages with no
+      // tool calls, so this component only adds the styled alert card when no
+      // visible text can carry it.
+      const terminalLines = terminalMember && visibleLines.length === 0
+        ? renderPendingActivityUpdate(terminalMember, width)
+        : [];
+      const appendTail = (activityLines: string[]) => [
+        ...activityLines,
+        ...terminalLines,
+        ...visibleLines,
+      ];
       const revealed = activityGroupRevealed(group);
       if (!revealed) {
         const activityLines = position.first
           ? ["", ...renderActivityGroupSummary(group, width, true)]
           : [];
-        return [...activityLines, ...visibleLines];
+        return appendTail(activityLines);
       }
 
       const groupTheme = activityGroupTheme(group);
@@ -831,10 +1050,16 @@ export default function prettyTui(pi: ExtensionAPI) {
         width,
         groupTheme,
       );
+      // Clean mode owns thought disclosure: revealing a group shows the thought
+      // member, while only a member click (or Ctrl+O) reveals its full text.
       const expanded = cleanToolsExpanded || expandedThinkingMembers.has(member.id);
       const settledOwner = position.first ? activityGroupOwner(group) : undefined;
-      const stableSummary = !position.first || Boolean(
-        settledOwner && settledSummaries.has(settledOwner) && !toolActivityHolds.has(settledOwner),
+      // A group without tools has no durable summary, so its own boundary is
+      // the signal that it finished.
+      const stableSummary = !position.first || (
+        settledOwner
+          ? Boolean(settledSummaries.has(settledOwner) && !toolActivityHolds.has(settledOwner))
+          : activityTimeline.isSettled(group.id)
       );
       const cacheable = !expanded && !this.isStreaming && stableSummary;
       const cached = cacheable ? this[cleanThinkingRenderCacheKey] : undefined;
@@ -848,7 +1073,7 @@ export default function prettyTui(pi: ExtensionAPI) {
         // Only the stable activity projection is cached. Visible assistant
         // text belongs outside the collapsible group and must be appended on
         // every render, including cache hits.
-        return [...cached.lines, ...visibleLines];
+        return appendTail(cached.lines);
       }
       const stateLabel = this.isStreaming ? "thinking" : "thought";
       const label = truncateToWidth(stateLabel, Math.max(1, childWidth - 2), "…");
@@ -856,28 +1081,11 @@ export default function prettyTui(pi: ExtensionAPI) {
         groupTheme.fg("toolTitle", groupTheme.bold(label));
       let contentLines: string[] = [header];
       if (expanded) {
-        const detailWidth = Math.max(1, childWidth - visibleWidth("  │ "));
-        const detailText = member.thinking ?? thinkingText(message);
-        let detail = this[cleanThinkingDetailKey];
-        if (!detail || detail.text !== detailText) {
-          detail = {
-            text: detailText,
-            component: new Markdown(
-              detailText,
-              0,
-              0,
-              this.markdownTheme,
-              {
-                color: (text: string) => groupTheme.fg("thinkingText", text),
-                italic: true,
-              },
-            ),
-          };
-          this[cleanThinkingDetailKey] = detail;
-        }
-        const detailLines = detail.component.render(detailWidth);
-        contentLines.push(...detailLines.map((line: string, index: number) =>
-          groupTheme.fg("dim", index === detailLines.length - 1 ? "  └ " : "  │ ") + line
+        contentLines.push(...thinkingDetailLines(
+          this,
+          member.thinking ?? thinkingText(message),
+          groupTheme,
+          Math.max(1, childWidth - visibleWidth("  │ ")),
         ));
       }
       const decorated = contentLines.map((line, index) =>
@@ -896,7 +1104,7 @@ export default function prettyTui(pi: ExtensionAPI) {
           lines: output,
         };
       }
-      return [...output, ...visibleLines];
+      return appendTail(output);
     };
 
     const patchedRender = function (this: any, width: number): string[] {
@@ -905,14 +1113,20 @@ export default function prettyTui(pi: ExtensionAPI) {
 
     const handleAssistantTranscriptMouse = function (this: any, event: any) {
       const message = this[originalMessageKey] ?? this.lastMessage;
-      if (renderMode !== "clean" || !eligibleThinking(message)) {
-        return originalHandleMouse.call(this, event);
+      if (renderMode !== "clean") return originalHandleMouse.call(this, event);
+      if (!eligibleThinking(message)) {
+        const terminalMember = assistantTerminalUpdate(message);
+        const terminalGroup = terminalMember
+          ? activityTimeline.groupForMember(terminalMember.id)
+          : undefined;
+        return terminalMember && terminalGroup && activityGroupCollapsible(terminalGroup)
+          ? handleActivityUpdateMouse(terminalGroup, terminalMember, event)
+          : originalHandleMouse.call(this, event);
       }
       const key = assistantMessageKey(message);
       const member = activityTimeline.memberForThinking(key);
       const group = member ? activityTimeline.groupForMember(member.id) : undefined;
       if (!member || !group) return originalHandleMouse.call(this, event);
-      if (group.toolCallIds.length === 0) return originalHandleMouse.call(this, event);
       const position = activityMemberPosition(group, member);
       const isLeftClick = event.type === "click" && event.button === "left";
 
@@ -1027,53 +1241,42 @@ export default function prettyTui(pi: ExtensionAPI) {
     ];
   };
 
-  const indexDisplayedCustomUpdateHints = (entries: any[]) => {
-    customUpdateToolHints.clear();
-    customUpdateBeforeToolHints.clear();
-    let lastToolCallId: string | undefined;
-    let pendingCustomKeys: string[] = [];
-    for (const entry of entries) {
-      if (entry?.type === "compaction") {
-        lastToolCallId = undefined;
-        pendingCustomKeys = [];
-        continue;
-      }
-      if (entry?.type === "custom_message") {
-        if (entry.display !== false) {
-          const key = customMessageKey(entry);
-          if (lastToolCallId) customUpdateToolHints.set(key, lastToolCallId);
-          else pendingCustomKeys.push(key);
-        }
-        continue;
-      }
-      if (entry?.type !== "message") continue;
-      const message = entry.message;
-      if (message?.role === "user") {
-        lastToolCallId = undefined;
-        pendingCustomKeys = [];
-        continue;
-      }
-      if (message?.role === "assistant") {
-        const toolCalls = (Array.isArray(message.content) ? message.content : [])
-          .filter((item: any) => item?.type === "toolCall" && item.id);
-        if (toolCalls.length > 0 && pendingCustomKeys.length > 0) {
-          for (const key of pendingCustomKeys) {
-            customUpdateToolHints.set(key, toolCalls[0].id);
-            customUpdateBeforeToolHints.add(key);
-          }
-          pendingCustomKeys = [];
-        }
-        if (visibleAssistantText(message) || assistantSystemBoundary(message)) {
-          lastToolCallId = undefined;
-          pendingCustomKeys = [];
-        }
-        for (const item of toolCalls) lastToolCallId = item.id;
-        continue;
-      }
-      if (message?.role === "toolResult" && message.toolCallId) {
-        lastToolCallId = message.toolCallId;
-      }
-    }
+  const appendRuntimeActivityUpdate = (
+    mode: any,
+    message: string,
+    severity: ActivitySeverity,
+  ): boolean => {
+    const [firstLine, ...remainingLines] = String(message).split("\n");
+    const fallbackTitle = severity === "warning"
+      ? "Warning"
+      : severity === "error"
+        ? "Error"
+        : "Info";
+    const title = firstLine || fallbackTitle;
+    const content = remainingLines.join("\n");
+    // Warnings and errors are standalone hard boundaries; only ordinary notices
+    // join the work in progress.
+    const standalone = severity === "warning" || severity === "error";
+    const updateKey = `runtime:${severity}:${++activityUpdateSequence}`;
+    if (standalone) closeCleanAtStandaloneAlert();
+    const existingGroup = activityTimeline.currentGroup();
+    const joinsWork = !standalone && hasWorkActivity(existingGroup);
+    const member = joinsWork
+      ? activityTimeline.addUpdate(updateKey, title, content, false, severity) ??
+        activityTimeline.addPendingUpdate(updateKey, title, content, false, severity)
+      : activityTimeline.addPendingUpdate(updateKey, title, content, false, severity);
+    if (!joinsWork) activityTimeline.boundary();
+    const group = activityTimeline.groupForMember(member.id);
+    if (!group || !mode.chatContainer?.addChild) return false;
+    const component: Component = {
+      render: (width: number) => renderActivityUpdateProjection(group, member, width),
+      invalidate() {},
+      handleMouse: (event: any) => handleActivityUpdateMouse(group, member, event),
+    } as Component;
+    activityUpdateComponents.set(member.id, component);
+    mode.chatContainer.addChild(component);
+    mode.ui?.requestRender?.();
+    return true;
   };
 
   const interactiveModePrototype = InteractiveMode.prototype as any;
@@ -1083,6 +1286,10 @@ export default function prettyTui(pi: ExtensionAPI) {
     const originalRenderSessionEntries = interactiveModePrototype.renderSessionEntries;
     const originalSwitchTuiMode = interactiveModePrototype.switchTuiMode;
     const originalShowExtensionNotify = interactiveModePrototype.showExtensionNotify;
+    const originalToggleThinkingBlockVisibility = interactiveModePrototype.toggleThinkingBlockVisibility;
+    const originalShowStatus = interactiveModePrototype.showStatus;
+    const originalShowWarning = interactiveModePrototype.showWarning;
+    const originalShowError = interactiveModePrototype.showError;
     const patchedSetToolsExpanded = function (this: any, expanded: boolean) {
       cleanToolsExpanded = expanded;
       changingAllToolsExpansion = true;
@@ -1107,7 +1314,6 @@ export default function prettyTui(pi: ExtensionAPI) {
       // while Pi's live compaction UI appends it chronologically. Keep reloads
       // and transcript rebuilds consistent with that live presentation.
       const orderedEntries = orderContextEntriesForTranscript(entries);
-      indexDisplayedCustomUpdateHints(orderedEntries);
       return originalRenderSessionEntries.call(this, orderedEntries, options);
     };
 
@@ -1118,41 +1324,78 @@ export default function prettyTui(pi: ExtensionAPI) {
       return result;
     };
 
+    // Pi's own showExtensionNotify only dispatches to showStatus/showWarning/
+    // showError, and all three are replaced above. Delegating back to it would
+    // therefore re-enter these patches instead of restoring native behaviour,
+    // which sent info notifications into the transient UI flash. Route straight
+    // to the original method that matches the severity instead.
+    const nativeExtensionNotify = function (
+      this: any,
+      text: string,
+      severity: ActivitySeverity,
+    ): void {
+      const direct = severity === "error"
+        ? originalShowError
+        : severity === "warning"
+          ? originalShowWarning
+          : originalShowStatus;
+      try {
+        if (typeof direct === "function") direct.call(this, text);
+        else originalShowExtensionNotify.call(this, text, severity === "info" ? undefined : severity);
+      } catch {
+        // This host has no transcript to write to. The notification is already
+        // recorded in the activity timeline, and it does not belong in the
+        // transient UI flash, which only carries Pi UI state messages.
+      }
+    };
+
     const patchedShowExtensionNotify = function (
       this: any,
       message: string,
       type?: "info" | "warning" | "error",
     ) {
-      if (renderMode !== "clean" || (type !== undefined && type !== "info")) {
+      if (renderMode !== "clean") {
         return originalShowExtensionNotify.call(this, message, type);
       }
+      const severity: ActivitySeverity = type ?? "info";
+      if (!appendRuntimeActivityUpdate(this, message, severity)) {
+        nativeExtensionNotify.call(this, message, severity);
+      }
+    };
+
+    const patchedToggleThinkingBlockVisibility = function (this: any) {
+      if (renderMode !== "clean") {
+        return originalToggleThinkingBlockVisibility.call(this);
+      }
+      // Do not change Pi's persisted hideThinkingBlock setting in clean mode.
+      // Thought details use the activity hierarchy instead: click one thought,
+      // or use Ctrl+O when every member should expand together.
+      this.showStatus(
+        "Thought details expand individually in clean mode\nClick a thought, or use Ctrl+O to expand all.",
+      );
+    };
+
+    const patchedShowStatus = function (this: any, message: string) {
+      if (renderMode !== "clean") return originalShowStatus.call(this, message);
       const [firstLine, ...remainingLines] = String(message).split("\n");
-      const updateKey = `info:${++activityUpdateSequence}`;
-      const title = firstLine || "Info";
-      const content = remainingLines.join("\n");
-      const member = activityTimeline.addUpdate(updateKey, title, content, false) ??
-        activityTimeline.addPendingUpdate(updateKey, title, content, false);
-      const group = activityTimeline.groupForMember(member.id);
-      if (!group || !this.chatContainer?.addChild) {
-        return originalShowExtensionNotify.call(this, message, type);
-      }
-      const component: Component = {
-        render: (width: number) => {
-          if (group.toolCallIds.length === 0) return renderPendingActivityUpdate(member, width);
-          const position = activityMemberPosition(group, member);
-          if (!activityGroupRevealed(group)) {
-            return position.first
-              ? ["", ...renderActivityGroupSummary(group, width, true)]
-              : [];
-          }
-          return renderActivityUpdate(group, member, width);
-        },
-        invalidate() {},
-        handleMouse: (event: any) => handleActivityUpdateMouse(group, member, event),
-      } as Component;
-      activityUpdateComponents.set(member.id, component);
-      this.chatContainer.addChild(component);
+      setLatestActivityStatus({
+        title: firstLine || "Status",
+        detail: remainingLines.join("\n"),
+        severity: "status",
+      });
       this.ui?.requestRender?.();
+    };
+
+    const patchedShowWarning = function (this: any, message: string) {
+      if (renderMode !== "clean" || !appendRuntimeActivityUpdate(this, message, "warning")) {
+        return originalShowWarning.call(this, message);
+      }
+    };
+
+    const patchedShowError = function (this: any, message: string) {
+      if (renderMode !== "clean" || !appendRuntimeActivityUpdate(this, message, "error")) {
+        return originalShowError.call(this, message);
+      }
     };
 
     interactiveModePrototype[toolsExpansionPatchKey] = {
@@ -1164,15 +1407,28 @@ export default function prettyTui(pi: ExtensionAPI) {
       patchedSwitchTuiMode,
       originalShowExtensionNotify,
       patchedShowExtensionNotify,
+      originalToggleThinkingBlockVisibility,
+      patchedToggleThinkingBlockVisibility,
+      originalShowStatus,
+      patchedShowStatus,
+      originalShowWarning,
+      patchedShowWarning,
+      originalShowError,
+      patchedShowError,
     };
     interactiveModePrototype.setToolsExpanded = patchedSetToolsExpanded;
     interactiveModePrototype.renderSessionEntries = patchedRenderSessionEntries;
     interactiveModePrototype.switchTuiMode = patchedSwitchTuiMode;
     interactiveModePrototype.showExtensionNotify = patchedShowExtensionNotify;
+    interactiveModePrototype.toggleThinkingBlockVisibility = patchedToggleThinkingBlockVisibility;
+    interactiveModePrototype.showStatus = patchedShowStatus;
+    interactiveModePrototype.showWarning = patchedShowWarning;
+    interactiveModePrototype.showError = patchedShowError;
 
     pi.on("session_shutdown", () => {
       fullscreenTui = false;
       currentTui = undefined;
+      clearLatestActivityStatus();
       currentExtensionUi = undefined;
       const patch = interactiveModePrototype[toolsExpansionPatchKey];
       if (!patch) return;
@@ -1188,11 +1444,27 @@ export default function prettyTui(pi: ExtensionAPI) {
       if (patch.patchedShowExtensionNotify === interactiveModePrototype.showExtensionNotify) {
         interactiveModePrototype.showExtensionNotify = patch.originalShowExtensionNotify;
       }
+      if (patch.patchedToggleThinkingBlockVisibility === interactiveModePrototype.toggleThinkingBlockVisibility) {
+        interactiveModePrototype.toggleThinkingBlockVisibility = patch.originalToggleThinkingBlockVisibility;
+      }
+      if (patch.patchedShowStatus === interactiveModePrototype.showStatus) {
+        interactiveModePrototype.showStatus = patch.originalShowStatus;
+      }
+      if (patch.patchedShowWarning === interactiveModePrototype.showWarning) {
+        interactiveModePrototype.showWarning = patch.originalShowWarning;
+      }
+      if (patch.patchedShowError === interactiveModePrototype.showError) {
+        interactiveModePrototype.showError = patch.originalShowError;
+      }
       if (
         interactiveModePrototype.setToolsExpanded === patch.originalSetToolsExpanded &&
         interactiveModePrototype.renderSessionEntries === patch.originalRenderSessionEntries &&
         interactiveModePrototype.switchTuiMode === patch.originalSwitchTuiMode &&
-        interactiveModePrototype.showExtensionNotify === patch.originalShowExtensionNotify
+        interactiveModePrototype.showExtensionNotify === patch.originalShowExtensionNotify &&
+        interactiveModePrototype.toggleThinkingBlockVisibility === patch.originalToggleThinkingBlockVisibility &&
+        interactiveModePrototype.showStatus === patch.originalShowStatus &&
+        interactiveModePrototype.showWarning === patch.originalShowWarning &&
+        interactiveModePrototype.showError === patch.originalShowError
       ) {
         delete interactiveModePrototype[toolsExpansionPatchKey];
       }
@@ -1527,8 +1799,14 @@ export default function prettyTui(pi: ExtensionAPI) {
             } else {
               // Defensive fallback for older Pi versions without the fullscreen helper.
               void copyToClipboard(region.code)
-                .then(() => currentExtensionUi?.notify("Copied!", "info"))
-                .catch(() => currentExtensionUi?.notify("Copy failed", "error"));
+                .then(() => setLatestActivityStatus({
+                  title: "Copied!",
+                  severity: "success",
+                }))
+                .catch(() => setLatestActivityStatus({
+                  title: "Copy failed",
+                  severity: "error",
+                }));
             }
           }
           return { handled: true, render: false };
@@ -1760,8 +2038,11 @@ export default function prettyTui(pi: ExtensionAPI) {
     return block(rows);
   };
 
-  const isError = (renderContext: any, output: string): boolean =>
-    Boolean(renderContext?.isError) || /^(error|failed|access denied)\b/i.test(output.trim());
+  // Pi's render context always carries the authoritative failure flag
+  // (tool-execution.js builds it from result.isError). A tool's own output text
+  // must never decide this: `grep -n Error`, `cat error.log`, or a test runner
+  // printing "failed 0" would otherwise mark a successful call as failed.
+  const isError = (renderContext: any): boolean => Boolean(renderContext?.isError);
 
   const partialResult = (context: any, theme: any, label: string): Component => {
     setStatus(context, "running");
@@ -1834,8 +2115,8 @@ export default function prettyTui(pi: ExtensionAPI) {
     return block(rows);
   };
 
-  const completeStatus = (context: any, output: string): boolean => {
-    const failed = isError(context, output);
+  const completeStatus = (context: any): boolean => {
+    const failed = isError(context);
     setStatus(context, failed ? "error" : "success");
     return failed;
   };
@@ -2351,6 +2632,15 @@ export default function prettyTui(pi: ExtensionAPI) {
     activityTimeline.boundary();
   };
 
+  closeCleanAtNativeCustomBoundary = () => {
+    finishCleanGroup("done");
+    settleLastCleanGroup();
+  };
+  closeCleanAtStandaloneAlert = () => {
+    finishCleanGroup("done");
+    settleLastCleanGroup();
+  };
+
   const settleLastCleanGroup = () => {
     const group = cleanRun.groups[cleanRun.groups.length - 1];
     if (!group) return;
@@ -2374,14 +2664,16 @@ export default function prettyTui(pi: ExtensionAPI) {
     const activityText = /^thinking(?:\.\.\.)?$/iu.test(normalizedActivityText)
       ? "thinking"
       : rawActivityText;
-    const countLabel = `${count} tool ${count === 1 ? "call" : "calls"}`;
+    const countLabel = count > 0 ? `${count} tool ${count === 1 ? "call" : "calls"}` : "";
     const thoughtLabel = thoughtCount > 0
-      ? ` · ${thoughtCount} ${thoughtCount === 1 ? "thought" : "thoughts"}`
+      ? `${thoughtCount} ${thoughtCount === 1 ? "thought" : "thoughts"}`
       : "";
-    const activityLabel = activityText !== "done" && activityText.trim()
-      ? ` · ${activityText}`
+    // Without tools there is no current tool name to report, and the generic
+    // "thinking" placeholder would only repeat the thought count.
+    const activityLabel = count > 0 && activityText !== "done" && activityText.trim()
+      ? activityText
       : "";
-    return `${countLabel}${thoughtLabel}${activityLabel}`;
+    return [countLabel, thoughtLabel, activityLabel].filter(Boolean).join(" · ");
   };
 
   const summaryRow = (
@@ -2455,36 +2747,53 @@ export default function prettyTui(pi: ExtensionAPI) {
   ): string[] => {
     const fit = (lines: string[]) => lines.map((line) => truncateToWidth(line, Math.max(1, width), ""));
     const summaryTheme = activityGroupTheme(group);
+    if (!summaryTheme || !activityTimeline.hasWork(group)) return [];
     const owner = activityGroupOwner(group);
-    if (!summaryTheme || !owner || group.toolCallIds.length === 0) return [];
-    const settled = settledSummaries.get(owner);
+    const settled = owner ? settledSummaries.get(owner) : undefined;
+    const toolCount = group.toolCallIds.length;
+    const live = () => cleanRun.activeToolName ?? currentCleanActivity();
     if (settled) {
       return fit(block([summaryRow(
         summaryTheme,
-        Math.max(settled.count, group.toolCallIds.length),
-        settled.failed,
+        group.hardBoundarySplit ? toolCount : Math.max(settled.count, toolCount),
+        group.hardBoundarySplit ? 0 : settled.failed,
         Math.max(settled.thoughtCount, group.thoughtCount),
         settled.activity,
         collapsedDone,
       )]).render(width));
     }
-    const currentBelongs = cleanRun.activeToolCallId
-      ? group.toolCallIds.includes(cleanRun.activeToolCallId)
-      : false;
-    const lastBelongs = cleanRun.lastCompletedToolCallId
-      ? group.toolCallIds.includes(cleanRun.lastCompletedToolCallId)
-      : false;
-    if (currentBelongs || lastBelongs || !cleanRun.settled) {
+    if (owner && !cleanRun.settled) {
+      // Live tool group: keep the current tool name and the running count.
       return fit(block([summaryRow(
         summaryTheme,
-        Math.max(group.toolCallIds.length, liveCleanToolCount()),
+        Math.max(toolCount, liveCleanToolCount()),
         cleanRun.failed,
         group.thoughtCount,
-        () => cleanRun.activeToolName ?? currentCleanActivity(),
+        live,
         collapsedDone,
       )]).render(width));
     }
-    return [];
+    if (!owner && !activityTimeline.isSettled(group.id)) {
+      // Thought-only group while the model is still working.
+      return fit(block([summaryRow(
+        summaryTheme,
+        toolCount,
+        cleanRun.failed,
+        group.thoughtCount,
+        "thinking",
+        collapsedDone,
+      )]).render(width));
+    }
+    // Finished group with no durable summary: a completed Thought-only turn, or
+    // a group split apart by a native custom renderer.
+    return fit(block([summaryRow(
+      summaryTheme,
+      toolCount,
+      0,
+      group.thoughtCount,
+      "done",
+      collapsedDone,
+    )]).render(width));
   };
 
   /**
@@ -2552,7 +2861,7 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const hiddenToolResult = (context: any, options: any, output: string): Component => {
     if (options.isPartial) setStatus(context, "running");
-    else completeStatus(context, output);
+    else completeStatus(context);
     return block([]);
   };
 
@@ -2620,17 +2929,18 @@ export default function prettyTui(pi: ExtensionAPI) {
 
   const restoreCleanSession = (ctx: any) => {
     currentExtensionUi = ctx.ui;
+    clearLatestActivityStatus();
     cleanToolsExpanded = ctx.ui.getToolsExpanded();
     settledSummaries.clear();
     legacySummaryLastToolCallIds.clear();
     activityTimeline.clear();
+    nativeCustomBoundaryKeys.clear();
     revealedActivityGroups.clear();
     expandedThinkingMembers.clear();
     thinkingComponents.clear();
     activityFallbackThemes.clear();
     activityUpdateComponents.clear();
-    customUpdateToolHints.clear();
-    customUpdateBeforeToolHints.clear();
+    activityUpdateMarkdownComponents.clear();
     activityUpdateSequence = 0;
     assistantBoundaryKeys.clear();
     knownToolCallIds.clear();
@@ -2848,7 +3158,7 @@ export default function prettyTui(pi: ExtensionAPI) {
 
       if (message.role === "assistant") {
         const thinking = thinkingText(message);
-        if (thinking && !assistantSystemBoundary(message)) {
+        if (thinking) {
           activityTimeline.addThinking(assistantMessageKey(message), thinking);
         }
         if (messageHasVisibleText(message)) finishGroup();
@@ -2857,7 +3167,7 @@ export default function prettyTui(pi: ExtensionAPI) {
           toolCalls.add(item.id);
           activityTimeline.addTool(item.id, item.name ?? "tool");
         }
-        if (assistantSystemBoundary(message)) finishGroup();
+        if (assistantTerminalState(message)) finishGroup();
         continue;
       }
 
@@ -2924,8 +3234,16 @@ export default function prettyTui(pi: ExtensionAPI) {
       (item: any) => item.type === "toolCall" && item.id,
     );
 
+  const conciseActivityText = (value: string): string =>
+    value
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean)
+      ?.replace(/^#{1,6}\s+/u, "")
+      .replace(/^\*\*(.*?)\*\*$/u, "$1") ?? "";
+
   const trackThinkingActivity = (message: any): void => {
-    if (message?.role !== "assistant" || assistantSystemBoundary(message)) return;
+    if (message?.role !== "assistant") return;
     const thinking = thinkingText(message);
     if (thinking) activityTimeline.addThinking(assistantMessageKey(message), thinking);
   };
@@ -2984,16 +3302,11 @@ export default function prettyTui(pi: ExtensionAPI) {
       closeAtAssistantBoundary(event.message, "done");
       return;
     }
-    if (assistantSystemBoundary(event.message)) {
-      closeAtAssistantBoundary(event.message, "done");
-      settleLastCleanGroup();
-      return;
-    }
     trackThinkingActivity(event.message);
     trackPendingToolActivity(event.message);
   });
   pi.on("message_end", (event) => {
-    if (hasVisibleAssistantText(event.message) || assistantSystemBoundary(event.message)) {
+    if (hasVisibleAssistantText(event.message)) {
       trackThinkingActivity(event.message);
       closeAtAssistantBoundary(event.message, "done");
       cleanRun.activity = "done";
@@ -3002,6 +3315,12 @@ export default function prettyTui(pi: ExtensionAPI) {
     }
     trackThinkingActivity(event.message);
     trackPendingToolActivity(event.message);
+    if (assistantTerminalState(event.message)) {
+      clearToolActivityHolds();
+      finishCleanGroup("done");
+      settleLastCleanGroup();
+      cleanRun.activity = "done";
+    }
   });
 
   pi.on("agent_start", () => {
@@ -3058,6 +3377,8 @@ export default function prettyTui(pi: ExtensionAPI) {
     }
     const visibleSummaryToolCallId = cleanRun.activeToolCallId ?? cleanRun.lastCompletedToolCallId;
     setCleanGroupMembers(visibleSummaryToolCallId, cleanRun.currentToolCallIds.slice());
+    // Tool success and failure remain owned by the activity group. The bottom
+    // line is reserved for transient UI status messages.
   });
   pi.on("agent_end", () => {
     // No summary is appended here: this event may be followed by an automatic
@@ -3129,7 +3450,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       if (hideCleanTool(context.toolCallId, options.expanded, context.executionStarted)) return hiddenToolResult(context, options, output);
       if (options.isPartial) return partialResult(context, theme, "Reading…");
       const image = toolResult.content?.find((item: any) => item.type === "image");
-      const failed = completeStatus(context, output);
+      const failed = completeStatus(context);
       if (image) return result(theme, "Read image", "", false, failed);
       const lines = nonEmptyLines(output);
       const truncated = toolResult.details?.truncation?.truncated ? " · truncated" : "";
@@ -3167,7 +3488,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       if (hideCleanTool(context.toolCallId, options.expanded, context.executionStarted)) return hiddenToolResult(context, options, output);
       if (useCompactToolView(context.toolCallId, options.expanded)) {
         if (options.isPartial) return partialResult(context, theme, "Running…");
-        const failed = completeStatus(context, output);
+        const failed = completeStatus(context);
         return result(theme, failed ? "Command failed" : "Done", "", false, failed);
       }
 
@@ -3175,7 +3496,7 @@ export default function prettyTui(pi: ExtensionAPI) {
         return bashResult(context, theme, "Running…", output, options.expanded, "running");
       }
 
-      const failed = isError(context, output);
+      const failed = isError(context);
       const outputLines = terminalOutputLines(output);
       const lineCount = outputLines.filter((line) => line.length > 0).length;
       const summary = failed
@@ -3208,7 +3529,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       const output = textContent(toolResult);
       if (hideCleanTool(context.toolCallId, options.expanded, context.executionStarted)) return hiddenToolResult(context, options, output);
       if (options.isPartial) return partialResult(context, theme, "Editing…");
-      const failed = completeStatus(context, output);
+      const failed = completeStatus(context);
       const diff = toolResult.details?.diff ?? "";
       const additions = diff.split("\n").filter((line: string) => line.startsWith("+") && !line.startsWith("+++")).length;
       const removals = diff.split("\n").filter((line: string) => line.startsWith("-") && !line.startsWith("---")).length;
@@ -3257,7 +3578,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       const output = textContent(toolResult);
       if (hideCleanTool(context.toolCallId, options.expanded, context.executionStarted)) return hiddenToolResult(context, options, output);
       if (options.isPartial) return partialResult(context, theme, "Writing…");
-      const failed = completeStatus(context, output);
+      const failed = completeStatus(context);
       return result(
         theme,
         failed ? output.split("\n")[0] || "Write failed" : "Written",
@@ -3283,7 +3604,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       const output = textContent(toolResult);
       if (hideCleanTool(context.toolCallId, options.expanded, context.executionStarted)) return hiddenToolResult(context, options, output);
       if (options.isPartial) return partialResult(context, theme, "Searching…");
-      const failed = completeStatus(context, output);
+      const failed = completeStatus(context);
       const matches = nonEmptyLines(output);
       return result(theme, failed ? output.split("\n")[0] : `Found ${matches} matches`, output, options.expanded, failed);
     },
@@ -3302,7 +3623,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       const output = textContent(toolResult);
       if (hideCleanTool(context.toolCallId, options.expanded, context.executionStarted)) return hiddenToolResult(context, options, output);
       if (options.isPartial) return partialResult(context, theme, "Searching…");
-      const failed = completeStatus(context, output);
+      const failed = completeStatus(context);
       const matches = nonEmptyLines(output);
       return result(theme, failed ? output.split("\n")[0] : `Found ${matches} paths`, output, options.expanded, failed);
     },
@@ -3321,7 +3642,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       const output = textContent(toolResult);
       if (hideCleanTool(context.toolCallId, options.expanded, context.executionStarted)) return hiddenToolResult(context, options, output);
       if (options.isPartial) return partialResult(context, theme, "Listing…");
-      const failed = completeStatus(context, output);
+      const failed = completeStatus(context);
       const entries = nonEmptyLines(output);
       return result(theme, failed ? output.split("\n")[0] : `Listed ${entries} entries`, output, options.expanded, failed);
     },
