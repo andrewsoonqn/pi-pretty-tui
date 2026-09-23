@@ -12,7 +12,7 @@ import {
   UserMessageComponent,
   initTheme,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text, TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
+import { Markdown, Text, TuiAltScreen, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
   ActivityTimeline,
   assistantTerminalState,
@@ -72,6 +72,7 @@ const extension = await jiti.import(join(process.cwd(), "extensions/index.ts"), 
 const handlers = new Map();
 const tools = new Map();
 const commands = new Map();
+const entryRenderers = new Map();
 const appendedEntries = [];
 const widgets = new Map();
 const pi = {
@@ -82,7 +83,7 @@ const pi = {
     handlers.set(name, eventHandlers);
   },
   registerCommand(name, command) { commands.set(name, command); },
-  registerEntryRenderer() {},
+  registerEntryRenderer(type, renderer) { entryRenderers.set(type, renderer); },
   registerTool(tool) { tools.set(tool.name, tool); },
 };
 extension(pi);
@@ -97,11 +98,11 @@ const widgetText = () => {
   return factory({}, theme).render(80).join("\n")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
 };
-const emit = async (name, event = {}, ctx = {}) => {
+const emit = async (name, event = {}, ctx = sessionContext([])) => {
   for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
 };
 const sessionContext = (entries) => ({
-  sessionManager: { buildContextEntries: () => entries },
+  sessionManager: { buildContextEntries: () => entries, getBranch: () => entries },
   ui: {
     getToolsExpanded: () => false,
     notify() {},
@@ -177,6 +178,51 @@ const renderCollapsedSummaries = async (entries) => {
   return visible;
 };
 const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool/.exec(output)?.[1]));
+
+// User messages render as transparent, right-aligned chat bubbles. Short text
+// determines the bubble width; long text wraps at 75% of the terminal width.
+{
+  const bubbleContext = sessionContext([]);
+  bubbleContext.ui.theme = {
+    fg(name, text) {
+      return name === "accent" ? `<accent>${text}</accent>` : text;
+    },
+  };
+  await emit("session_start", {}, bubbleContext);
+  const plainLines = (component, width) => component.render(width).map((line) =>
+    stripTerminalSequences(line).replaceAll("<accent>", "").replaceAll("</accent>", ""),
+  );
+  const frameBounds = (line) => {
+    const start = line.indexOf("╭");
+    const end = line.indexOf("╮", start);
+    return { start, width: visibleWidth(line.slice(start, end + 1)) };
+  };
+
+  const shortBubble = new UserMessageComponent("已发布");
+  const shortRaw = shortBubble.render(80);
+  const shortLines = plainLines(shortBubble, 80);
+  const shortFrame = frameBounds(shortLines[0]);
+  assert.ok(shortRaw[0].includes("<accent>"), shortRaw[0]);
+  assert.ok(!shortLines.join("\n").includes("User"), shortLines.join("\n"));
+  assert.equal(shortFrame.width, 10);
+  assert.equal(shortFrame.start, 69);
+  assert.ok(shortLines.some((line) => line.includes("已发布")));
+  assert.ok(!shortRaw.join("\n").match(/\x1b\[(?:4[0-9]|10[0-7]|48(?:;|:))/));
+
+  const longText = "A long user message should wrap inside a bounded chat bubble while preserving a clear blank area on its left side. ".repeat(3);
+  const longBubble = new UserMessageComponent(longText);
+  const longLines = plainLines(longBubble, 80);
+  const longFrame = frameBounds(longLines[0]);
+  assert.ok(longFrame.width <= 60 && longFrame.width >= 50, longLines[0]);
+  assert.equal(longFrame.start, 79 - longFrame.width);
+  assert.ok(longFrame.start >= 19, longLines[0]);
+  assert.ok(longLines.length > 4, longLines.join("\n"));
+  for (const line of longLines) assert.equal(visibleWidth(line), 80, line);
+
+  const narrowLines = plainLines(longBubble, 20);
+  assert.ok(frameBounds(narrowLines[0]).start >= 1, narrowLines[0]);
+  for (const line of narrowLines) assert.equal(visibleWidth(line), 20, line);
+}
 
 // The transcript-first model keeps thinking, tools, and updates in order
 // across explicit transcript boundaries.
@@ -1462,6 +1508,204 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   assert.notEqual(warningColor, errorColor);
 }
 
+// A settled agent turn gets a durable completion footer. Duration spans the
+// whole run, Copy includes only the final visible answer, and reload restores
+// the answer association without duplicating the text in footer data.
+{
+  appendedEntries.length = 0;
+  const footerBranch = [];
+  const footerContext = sessionContext(footerBranch);
+  footerContext.sessionManager.getBranch = () => footerBranch;
+  await emit("session_start", {}, footerContext);
+  const originalNow = Date.now;
+  let now = 1_000;
+  Date.now = () => now;
+  try {
+    await emit("agent_start");
+    now = 30_000;
+    await emit("agent_end");
+    now = 31_000;
+    await emit("agent_start");
+    const finalAnswer = {
+      role: "assistant",
+      timestamp: 70_000,
+      stopReason: "stop",
+      content: [
+        { type: "thinking", thinking: "Private reasoning is not copied" },
+        { type: "text", text: "Final answer, first block." },
+        { type: "text", text: "Second block." },
+      ],
+    };
+    await emit("message_end", { message: finalAnswer });
+    // A later message_end extension can replace the answer before Pi persists
+    // it. Only the committed message may be copied by the footer.
+    footerBranch.push({
+      id: "footer-answer",
+      parentId: null,
+      type: "message",
+      message: {
+        ...finalAnswer,
+        content: [
+          { type: "text", text: "Published answer, first block." },
+          { type: "text", text: "Second block." },
+        ],
+      },
+    });
+    now = 66_000;
+    await emit("agent_settled", {}, footerContext);
+    await emit("agent_settled", {}, footerContext);
+  } finally {
+    Date.now = originalNow;
+  }
+
+  const footerEntries = appendedEntries.filter((entry) => entry.type === "pretty-tui-response-footer");
+  assert.equal(footerEntries.length, 1);
+  const footerEntry = footerEntries[0];
+  assert.deepEqual(footerEntry.data, {
+    answerEntryId: "footer-answer",
+    durationMs: 65_000,
+    outcome: "completed",
+  });
+  assert.equal("answer" in footerEntry.data, false);
+
+  const nativeCopies = [];
+  const fullscreenUi = {
+    mode: "fullscreen",
+    async copyTextToClipboard(text) {
+      nativeCopies.push(text);
+      return true;
+    },
+  };
+  try {
+    InteractiveMode.prototype.renderSessionEntries.call({ ui: fullscreenUi }, []);
+  } catch {}
+  const footerRenderer = entryRenderers.get("pretty-tui-response-footer");
+  assert.ok(footerRenderer);
+  const renderFooter = (entry = footerEntry, width = 80) => {
+    const component = footerRenderer(
+      { id: "footer-test", type: "custom", customType: entry.type, data: entry.data },
+      { expanded: false },
+      theme,
+    );
+    const lines = component.render(width);
+    return { component, lines, plain: lines.map(stripTerminalSequences) };
+  };
+  const liveFooter = renderFooter();
+  assert.equal(liveFooter.plain.length, 1);
+  assert.ok(liveFooter.plain[0].startsWith("── ✓ Completed in 1m 5s "), liveFooter.plain[0]);
+  assert.ok(liveFooter.plain[0].endsWith(" [Copy] ──"), liveFooter.plain[0]);
+  const copyX = liveFooter.plain[0].indexOf("[Copy]") + 1;
+  assert.ok(copyX > 0, liveFooter.plain[0]);
+  assert.equal(liveFooter.component.handleMouse({
+    type: "press", button: "left", x: copyX, y: 0, width: 80, height: 1,
+  })?.handled, true);
+  assert.equal(liveFooter.component.handleMouse({
+    type: "click", button: "left", x: copyX, y: 0, width: 80, height: 1,
+  })?.handled, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(nativeCopies, ["Published answer, first block.\n\nSecond block."]);
+
+  const restoredAnswer = {
+    type: "message",
+    id: "footer-answer",
+    parentId: null,
+    timestamp: "2026-01-01T00:01:10.000Z",
+    message: {
+      role: "assistant",
+      timestamp: 70_000,
+      stopReason: "stop",
+      content: [{ type: "text", text: "Published answer, first block.\n\nSecond block." }],
+    },
+  };
+  const restoredFooter = {
+    type: "custom",
+    id: "footer-entry",
+    parentId: "footer-answer",
+    timestamp: "2026-01-01T00:01:11.000Z",
+    customType: "pretty-tui-response-footer",
+    data: footerEntry.data,
+  };
+  const olderAnswer = {
+    ...restoredAnswer,
+    id: "older-answer",
+    message: {
+      ...restoredAnswer.message,
+      // Timestamp collisions must not mix the answers for distinct footers.
+      content: [{ type: "text", text: "Older answer, same timestamp" }],
+    },
+  };
+  const olderFooter = {
+    ...restoredFooter,
+    id: "older-footer",
+    parentId: "older-answer",
+    data: { ...footerEntry.data, answerEntryId: "older-answer" },
+  };
+  await emit("session_start", {}, sessionContext([olderAnswer, olderFooter, restoredAnswer, restoredFooter]));
+  const afterReload = renderFooter();
+  assert.ok(afterReload.plain[0].includes("[Copy]"), afterReload.plain[0]);
+  const clickFooter = (rendered) => {
+    const x = rendered.plain[0].indexOf("[Copy]") + 1;
+    assert.ok(x > 0);
+    rendered.component.handleMouse({ type: "click", button: "left", x, y: 0, width: 80, height: 1 });
+  };
+  clickFooter(renderFooter(olderFooter));
+  clickFooter(afterReload);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(nativeCopies.slice(-2), [
+    "Older answer, same timestamp",
+    "Published answer, first block.\n\nSecond block.",
+  ]);
+
+  appendedEntries.length = 0;
+  const stoppedBranch = [];
+  const stoppedContext = sessionContext(stoppedBranch);
+  stoppedContext.sessionManager.getBranch = () => stoppedBranch;
+  await emit("session_start", {}, stoppedContext);
+  await emit("agent_start");
+  const interimMessage = {
+    role: "assistant", timestamp: 71_000,
+    content: [{ type: "text", text: "Searching, not a final answer" }],
+  };
+  await emit("message_end", { message: interimMessage });
+  stoppedBranch.push({ type: "message", id: "interim", parentId: null, message: interimMessage });
+  const terminalMessage = {
+    role: "assistant",
+    timestamp: 72_000,
+    stopReason: "aborted",
+    errorMessage: "Request was aborted",
+    content: [],
+  };
+  await emit("message_end", { message: terminalMessage });
+  stoppedBranch.push({ type: "message", id: "aborted", parentId: "interim", message: terminalMessage });
+  await emit("agent_settled", {}, stoppedContext);
+  const stoppedEntry = appendedEntries.find((entry) => entry.type === "pretty-tui-response-footer");
+  assert.equal(stoppedEntry.data.outcome, "stopped");
+  assert.equal(stoppedEntry.data.answerEntryId, undefined);
+  const stopped = renderFooter(stoppedEntry);
+  assert.ok(stopped.plain[0].includes("⚠ Stopped after"), stopped.plain[0]);
+  assert.ok(!stopped.plain[0].includes("[Copy]"), stopped.plain[0]);
+
+  const footerColors = [];
+  const styledFooter = footerRenderer(
+    { id: "footer-color", type: "custom", customType: footerEntry.type, data: footerEntry.data },
+    { expanded: false },
+    {
+      bold: (text) => text,
+      fg(name, text) {
+        footerColors.push(name);
+        return text;
+      },
+    },
+  );
+  styledFooter.render(80);
+  assert.deepEqual([...new Set(footerColors)], ["dim"]);
+
+  try {
+    InteractiveMode.prototype.renderSessionEntries.call({ ui: { mode: "regular" } }, []);
+  } catch {}
+  assert.ok(!renderFooter().plain[0].includes("[Copy]"));
+}
+
 // Fullscreen Markdown shows per-block Copy controls with precise hit regions;
 // regular mode hides them and invalidation drops stale regions.
 {
@@ -1587,6 +1831,17 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(nativeCopies, ["const a = 1;"]);
 
+  const indentedFixture = transcriptMarkdownFixture("```txt\n  keep indentation\n```");
+  const indentedLines = indentedFixture.render(42).map(stripControls);
+  const indentedY = indentedLines.findIndex((line) => line.includes("[Copy]"));
+  assert.ok(indentedY >= 0);
+  indentedFixture.handleMouse({
+    type: "click", button: "left", x: indentedLines[indentedY].indexOf("[Copy]") + 1,
+    y: indentedY, width: 42, height: indentedLines.length,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(nativeCopies.at(-1), "  keep indentation");
+
   const copyFirst = {
     type: "message",
     id: "30",
@@ -1650,7 +1905,7 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     type: "click", button: "left", x: mixedCopyX, y: mixedCopyY, width: 42, height: mixedCopyLines.length,
   })?.handled, true);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(nativeCopies, ["const a = 1;", "echo mixed response"]);
+  assert.deepEqual(nativeCopies, ["const a = 1;", "  keep indentation", "echo mixed response"]);
 
   assert.ok(lines.every((line) => visibleWidth(line) <= 42));
   for (const width of [1, 4, 7, 8, 17, 18, 24]) {

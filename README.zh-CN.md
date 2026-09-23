@@ -7,9 +7,10 @@
 ## 功能特性
 
 - **可折叠的活动时间线：** 不再让大量独立调用填满对话。思考、工具和普通 `info` 通知会进入同一条按真实时间排序的活动流；工作进行时显示为 `Running(...)`，结束后变为低调的 `Done(...)`。父级只统计工具调用和思考数量；展开后可查看所有有序成员，成员摘要在展开嵌套详情后仍然保留。思考与工具地位相同：没有调用任何工具的那一轮同样会有自己的 `Running(1 thought)` / `Done(1 thought)` 父行，思考作为其子级，内容不会被丢弃。
+- **可持久化的回答 footer：** 整轮 Agent 工作真正 settled 后（包括工具、自动重试和 compaction），最终回答底部会显示一条低调的灰色分隔线，工作时长与 fullscreen 模式下的 `[Copy]` 控件都嵌在线中。`[Copy]` 只复制最终可见回答，不包含 thought、工具、状态或 footer；reload 和 session tree 切换后仍会保留。
 - **临时 UI 状态：** 编辑器上方的一行只显示 Pi 直接产生的 UI 操作反馈，例如 Thinking 或工具输出可见性变化。新状态会替换旧状态，并在十秒后自动消失，不进入 transcript 或 session。
 - **按需查看有效信息：** 针对不同工具设计的摘要，会简洁呈现路径、命令、结果、diff、文件预览和实时 shell 输出，同时保留查看原始完整内容的能力。
-- **统一、精致的视觉体验：** 圆角用户消息与输入框、主题感知配色、层级清晰的 Markdown 标题、更清爽的列表，以及带语法高亮的圆角代码块，让整个 TUI 更协调。在 fullscreen 模式下，每个围栏代码块还带有符合原生体验的 `[Copy]` 控件。
+- **统一、精致的视觉体验：** 透明、右对齐的用户聊天气泡会根据短消息自适应宽度，长消息则在终端宽度的 75% 处换行；气泡使用 accent 浅蓝色圆角边框，并移除了多余的 `User` 标注。配合圆角输入框、主题感知配色、层级清晰的 Markdown 标题、更清爽的列表，以及带语法高亮的圆角代码块，让整个 TUI 更协调。在 fullscreen 模式下，每个围栏代码块还带有符合原生体验的 `[Copy]` 控件。
 
 Pi 内置的 `read`、`bash`、`edit`、`write`、`grep`、`find` 和 `ls` 工具使用专门设计的紧凑视图；所有第三方工具会自动获得统一的紧凑行，单独展开时继续使用原生 renderer，但会移除与整体冲突的终端背景色。用户与 steer 消息、compaction 摘要、可见 assistant 正文、warning、error、aborted/length 响应，以及注册了专用 renderer 的 displayed custom message 都会形成硬分组边界。同时不会影响 Pi 原有的光标、输入法、自动补全、鼠标交互和工具执行行为。
 
@@ -58,11 +59,11 @@ npm install
 npm test
 ```
 
-测试覆盖实时与历史恢复的活动时间线、自动重试与终止状态、用户/steer/compaction/原生 renderer 边界、十秒 UI 状态替换、reload 与 shutdown 时的旧 timer 与状态清理、独立严重级别样式、内置与第三方工具、可展开思考、并行工具完成归属、孤立 tool call、重复摘要防护、原型补丁的完整恢复，以及 fullscreen 代码块复制的点击区域。GitHub Actions 会在每次 push 和 pull request 时运行相同检查。
+测试覆盖实时与历史恢复的活动时间线、自动重试与终止状态、用户/steer/compaction/原生 renderer 边界、十秒 UI 状态替换、reload 与 shutdown 时的旧 timer 与状态清理、独立严重级别样式、内置与第三方工具、可展开思考、并行工具完成归属、孤立 tool call、重复摘要防护、可持久化的工作时长与仅回答复制控件、自适应用户聊天气泡、原型补丁的完整恢复，以及 fullscreen 代码块复制的点击区域。GitHub Actions 会在每次 push 和 pull request 时运行相同检查。
 
 ## 兼容性说明
 
-工具渲染使用 Pi 的公开扩展 API。活动工具状态通过 Pi 导出的交互组件跟随其内置执行状态变化；clean 模式的 thought 详情使用活动时间线自身的展开状态，full 和 compact 模式则保留 Pi 内置的 Thinking 可见性控制。由于 Pi 目前没有为这些展示细节提供公开渲染钩子，原生用户消息框、原生输入编辑器圆角、无序列表标记和围栏代码块增强需要使用可安全重载的运行时补丁。Markdown 增强仅在渲染主 transcript 中的用户消息和助手回复时启用；扩展 overlay 创建的 Markdown 保持 Pi 原生布局。Markdown 解析、语法高亮和终端语义区域仍由 Pi 处理。
+工具渲染使用 Pi 的公开扩展 API。活动工具状态通过 Pi 导出的交互组件跟随其内置执行状态变化；clean 模式的 thought 详情使用活动时间线自身的展开状态，full 和 compact 模式则保留 Pi 内置的 Thinking 可见性控制。由于 Pi 目前没有为这些展示细节提供公开渲染钩子，自适应的原生用户消息气泡、原生输入编辑器圆角、无序列表标记和围栏代码块增强需要使用可安全重载的运行时补丁。Markdown 增强仅在渲染主 transcript 中的用户消息和助手回复时启用；扩展 overlay 创建的 Markdown 保持 Pi 原生布局。Markdown 解析、语法高亮和终端语义区域仍由 Pi 处理。
 
 本扩展不会修改 Pi 源文件。运行时补丁会在会话关闭时移除，但未来的 Pi 版本可能需要本扩展同步适配。
 

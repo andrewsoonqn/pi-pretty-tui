@@ -43,6 +43,7 @@ import {
 type PrettyTuiMode = "full" | "compact" | "clean";
 const CLEAN_TOOL_ACTIVITY_MIN_MS = 1000;
 const TRANSIENT_UI_STATUS_MS = 10_000;
+const RESPONSE_FOOTER_ENTRY_TYPE = "pretty-tui-response-footer";
 const SPECIALIZED_TOOL_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 
 const stripAnsiBackgrounds = (value: string): string =>
@@ -167,6 +168,49 @@ export default function prettyTui(pi: ExtensionAPI) {
       clearLatestActivityStatus();
       currentTui?.requestRender?.();
     }, TRANSIENT_UI_STATUS_MS);
+  };
+  const copyTranscriptText = (text: string) => {
+    // Code-block copy must preserve leading/trailing whitespace and indentation.
+    // Answers are normalized separately by assistantAnswerText().
+    if (!text.trim()) return;
+    const copyText = text;
+    if (typeof currentTui?.copyTextToClipboard === "function") {
+      // Fullscreen uses Pi's native clipboard path and native flash feedback.
+      void Promise.resolve(currentTui.copyTextToClipboard(copyText)).catch(() => {
+        currentTui?.flash?.("Copy failed");
+      });
+      return;
+    }
+    void copyToClipboard(copyText)
+      .then(() => setLatestActivityStatus({ title: "Copied!", severity: "success" }))
+      .catch(() => setLatestActivityStatus({ title: "Copy failed", severity: "error" }));
+  };
+  type ResponseFooterData = {
+    answerEntryId?: string;
+    durationMs: number;
+    outcome: "completed" | "stopped";
+  };
+  const responseAnswerTexts = new Map<string, string>();
+  let responseRunStartedAt: number | undefined;
+  let responseHasAssistantMessage = false;
+  const assistantAnswerText = (message: any): string => {
+    if (typeof message?.content === "string") return message.content.trim();
+    if (!Array.isArray(message?.content)) return "";
+    return message.content
+      .filter((item: any) => item?.type === "text" && typeof item.text === "string" && item.text.trim())
+      .map((item: any) => item.text.trim())
+      .join("\n\n")
+      .trim();
+  };
+  const formatResponseDuration = (durationMs: number): string => {
+    const totalSeconds = Math.max(1, Math.round(Math.max(0, durationMs) / 1000));
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (totalMinutes < 60) return `${totalMinutes}m ${seconds}s`;
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return `${hours}h ${String(minutes).padStart(2, "0")}m`;
   };
   const activityTimeline = new ActivityTimeline();
   const revealedActivityGroups = new Set<string>();
@@ -652,8 +696,10 @@ export default function prettyTui(pi: ExtensionAPI) {
     });
   }
 
-  // Render user prompts as a titled, rounded frame while preserving Pi's
-  // original Markdown component, wrapping, output padding, and OSC 133 zones.
+  // Render user prompts as right-aligned, content-sized chat bubbles while
+  // preserving Pi's Markdown component, wrapping, output padding, and OSC 133
+  // zones. Long messages stop at 75% of the terminal width; narrow terminals
+  // trade away the left gap before sacrificing readability.
   const userMessagePrototype = UserMessageComponent.prototype as any;
   const userMessagePatchKey = Symbol.for("pretty-tui.user-message-frame");
   if (!userMessagePrototype[userMessagePatchKey]) {
@@ -663,66 +709,118 @@ export default function prettyTui(pi: ExtensionAPI) {
       const content = this.children?.[0] as any;
       if (!content) return;
 
-      // Reuse Pi's theme-aware user background across the complete frame.
-      const userMessageBg = content.bgFn as ((text: string) => string) | undefined;
+      // Remove Pi's full-width user-message background. The Markdown keeps its
+      // native foreground styling, while the surrounding bubble stays transparent.
       content.paddingX = 0;
       content.paddingY = 0;
       content.setBgFn?.(undefined);
       content.invalidate?.();
+      // Pi wraps the Markdown in a full-width Box. Render the Markdown child
+      // directly so short messages expose their natural visible width instead
+      // of inheriting the Box's width-filling padding.
+      const markdown = content.children?.[0] ?? content;
 
       const outputPad = Math.max(0, Number(this.outputPad) || 0);
       const markdownTheme = this.markdownTheme;
-      const border = (text: string) => markdownTheme.quoteBorder(text);
+      // Markdown deliberately pads every rendered line to the requested width.
+      // Remove only that trailing layout padding before measuring or framing;
+      // ANSI styling and the visible content remain untouched.
+      const renderMarkdown = (width: number): string[] =>
+        withTranscriptMarkdown(() => markdown.render(width))
+          .map((line: string) => line.replace(/ +$/u, ""));
+      const layout = (width: number) => {
+        const terminalWidth = Math.max(1, width);
+        const rightPad = Math.min(outputPad, Math.max(0, terminalWidth - 1));
+        const availableWidth = Math.max(1, terminalWidth - rightPad);
+        if (availableWidth < 4) {
+          return {
+            framed: false,
+            rightPad,
+            leftPad: 0,
+            frameWidth: availableWidth,
+            contentWidth: availableWidth,
+            body: renderMarkdown(availableWidth),
+          };
+        }
+
+        const preferredMaximum = Math.max(4, Math.floor(terminalWidth * 0.75));
+        // Keep at least one blank column on the left whenever a framed bubble
+        // fits, even after a narrow terminal relaxes the usual 75% maximum.
+        const bubbleAvailable = availableWidth >= 5 ? availableWidth - 1 : availableWidth;
+        const narrowReadableMinimum = Math.min(bubbleAvailable, 24);
+        const frameMaximum = Math.min(
+          bubbleAvailable,
+          Math.max(preferredMaximum, narrowReadableMinimum),
+        );
+        const measuringWidth = Math.max(1, frameMaximum - 4);
+        const measuredBody = renderMarkdown(measuringWidth);
+        const naturalContentWidth = Math.max(
+          1,
+          ...measuredBody.map((line: string) => visibleWidth(line)),
+        );
+        const frameWidth = Math.min(frameMaximum, naturalContentWidth + 4);
+        const contentWidth = Math.max(1, frameWidth - 4);
+        const body = contentWidth === measuringWidth
+          ? measuredBody
+          : renderMarkdown(contentWidth);
+        return {
+          framed: true,
+          rightPad,
+          leftPad: Math.max(0, terminalWidth - rightPad - frameWidth),
+          frameWidth,
+          contentWidth,
+          body,
+        };
+      };
+      const border = (text: string) => currentExtensionUi?.theme?.fg
+        ? currentExtensionUi.theme.fg("accent", text)
+        : markdownTheme.quoteBorder(text);
       const frame: Component = {
         render(width: number): string[] {
-          const sidePad = Math.min(outputPad, Math.max(0, Math.floor((width - 1) / 2)));
-          const outer = " ".repeat(sidePad);
-          const frameWidth = Math.max(1, width - sidePad * 2);
-          const paintBackground = (line: string) => {
-            const padding = " ".repeat(Math.max(0, frameWidth - visibleWidth(line)));
-            return userMessageBg ? userMessageBg(line + padding) : line + padding;
-          };
-          if (frameWidth < 4) {
-            return content.render(frameWidth).map((line: string) => outer + paintBackground(line));
+          const measured = layout(width);
+          const left = " ".repeat(measured.leftPad);
+          const right = " ".repeat(measured.rightPad);
+          if (!measured.framed) {
+            return measured.body.map((line: string) => left + line + right);
           }
 
-          const title = " User ";
-          const topStart = "╭─";
-          const topTail = "─".repeat(Math.max(0, frameWidth - visibleWidth(topStart) - visibleWidth(title) - 1));
-          const top = border(topStart + markdownTheme.bold(title) + topTail + "╮");
-          const bottom = border("╰" + "─".repeat(Math.max(0, frameWidth - 2)) + "╯");
-          const contentWidth = Math.max(1, frameWidth - 4);
-          const body = withTranscriptMarkdown(() => content.render(contentWidth)).map((line: string) => {
-            const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(line)));
+          const top = border("╭" + "─".repeat(Math.max(0, measured.frameWidth - 2)) + "╮");
+          const bottom = border("╰" + "─".repeat(Math.max(0, measured.frameWidth - 2)) + "╯");
+          const body = measured.body.map((line: string) => {
+            const padding = " ".repeat(Math.max(0, measured.contentWidth - visibleWidth(line)));
             return border("│ ") + line + padding + border(" │");
           });
-          return [top, ...body, bottom].map((line: string) => outer + paintBackground(line));
+          return [top, ...body, bottom].map((line: string) => left + line + right);
         },
         handleMouse(event: any) {
-          if (!content.handleMouse) return undefined;
-          const sidePad = Math.min(outputPad, Math.max(0, Math.floor((event.width - 1) / 2)));
-          const frameWidth = Math.max(1, event.width - sidePad * 2);
-          if (frameWidth < 4) {
-            return withTranscriptMarkdown(() => content.handleMouse({
+          if (!markdown.handleMouse) return undefined;
+          const measured = layout(event.width);
+          if (!measured.framed) {
+            return withTranscriptMarkdown(() => markdown.handleMouse({
               ...event,
-              x: event.x - sidePad,
-              width: frameWidth,
+              x: event.x - measured.leftPad,
+              width: measured.contentWidth,
             }));
           }
-          const contentWidth = Math.max(1, frameWidth - 4);
-          if (event.y <= 0 || event.x < sidePad + 2 || event.x >= sidePad + 2 + contentWidth) {
+          const contentX = measured.leftPad + 2;
+          if (
+            event.y <= 0 ||
+            event.y > measured.body.length ||
+            event.x < contentX ||
+            event.x >= contentX + measured.contentWidth
+          ) {
             return undefined;
           }
-          return withTranscriptMarkdown(() => content.handleMouse({
+          return withTranscriptMarkdown(() => markdown.handleMouse({
             ...event,
-            x: event.x - sidePad - 2,
+            x: event.x - contentX,
             y: event.y - 1,
-            width: contentWidth,
-            height: Math.max(0, event.height - 2),
+            width: measured.contentWidth,
+            height: measured.body.length,
           }));
         },
         invalidate() {
-          content.invalidate?.();
+          markdown.invalidate?.();
         },
       };
 
@@ -1789,26 +1887,7 @@ export default function prettyTui(pi: ExtensionAPI) {
             event.y === candidate.y && event.x >= candidate.xStart && event.x < candidate.xEnd,
         );
         if (region) {
-          if (event.type === "click") {
-            if (typeof currentTui?.copyTextToClipboard === "function") {
-              // Match fullscreen selection exactly: use Pi TUI's clipboard path
-              // and its transient "Copied!" / "Copy failed" flash feedback.
-              void Promise.resolve(currentTui.copyTextToClipboard(region.code)).catch(() => {
-                currentTui?.flash?.("Copy failed");
-              });
-            } else {
-              // Defensive fallback for older Pi versions without the fullscreen helper.
-              void copyToClipboard(region.code)
-                .then(() => setLatestActivityStatus({
-                  title: "Copied!",
-                  severity: "success",
-                }))
-                .catch(() => setLatestActivityStatus({
-                  title: "Copy failed",
-                  severity: "error",
-                }));
-            }
-          }
+          if (event.type === "click") copyTranscriptText(region.code);
           return { handled: true, render: false };
         }
       }
@@ -2879,6 +2958,62 @@ export default function prettyTui(pi: ExtensionAPI) {
       (renderMode === "clean" && isCleanGroupRevealed(toolCallId))
     );
 
+  pi.registerEntryRenderer<ResponseFooterData>(RESPONSE_FOOTER_ENTRY_TYPE, (entry, _options, theme) => {
+    let copyStart = -1;
+    let copyWidth = 0;
+    return {
+      render(width: number): string[] {
+        const data = entry.data;
+        if (!data || width <= 0) return [];
+        copyStart = -1;
+        copyWidth = 0;
+        const answer = data.answerEntryId ? responseAnswerTexts.get(data.answerEntryId) ?? "" : "";
+        const copyLabel = "[Copy]";
+        const showCopy = fullscreenTui && Boolean(answer.trim()) && width >= 30;
+        const duration = formatResponseDuration(data.durationMs);
+        const statusText = data.outcome === "stopped"
+          ? `⚠ Stopped after ${duration}`
+          : `✓ Completed in ${duration}`;
+        const leading = "── ";
+        const trailing = showCopy ? ` ${copyLabel} ──` : "──";
+        const fixedWidth = visibleWidth(leading) + visibleWidth(trailing) + 1;
+        if (width <= fixedWidth) return [theme.fg("dim", "─".repeat(width))];
+
+        const statusWidth = Math.max(1, width - fixedWidth);
+        const visibleStatus = truncateToWidth(statusText, statusWidth, "…");
+        const prefix = leading + visibleStatus + " ";
+        const fill = "─".repeat(Math.max(0, width - visibleWidth(prefix) - visibleWidth(trailing)));
+        const line = prefix + fill + trailing;
+        if (showCopy) {
+          const copyIndex = line.indexOf(copyLabel);
+          copyStart = visibleWidth(line.slice(0, copyIndex));
+          copyWidth = visibleWidth(copyLabel);
+        }
+        // The divider, completion text, and Copy control intentionally share
+        // one quiet gray treatment; position alone communicates the hierarchy.
+        return [theme.fg("dim", line)];
+      },
+      handleMouse(event: TuiMouseEvent) {
+        if (
+          copyStart < 0 ||
+          event.button !== "left" ||
+          (event.type !== "press" && event.type !== "click") ||
+          event.y !== 0 ||
+          event.x < copyStart ||
+          event.x >= copyStart + copyWidth
+        ) {
+          return undefined;
+        }
+        if (event.type === "click" && entry.data?.answerEntryId) {
+          const answer = responseAnswerTexts.get(entry.data.answerEntryId);
+          if (answer) copyTranscriptText(answer);
+        }
+        return { handled: true, render: false };
+      },
+      invalidate() {},
+    };
+  });
+
   pi.registerEntryRenderer<ToolSummaryData>("pretty-tui-tool-summary", (entry, { expanded }, theme) => ({
     render(width: number): string[] {
       if (renderMode !== "clean" || expanded || cleanContextCompacted) return [];
@@ -2934,6 +3069,9 @@ export default function prettyTui(pi: ExtensionAPI) {
     settledSummaries.clear();
     legacySummaryLastToolCallIds.clear();
     activityTimeline.clear();
+    responseAnswerTexts.clear();
+    responseRunStartedAt = undefined;
+    responseHasAssistantMessage = false;
     nativeCustomBoundaryKeys.clear();
     revealedActivityGroups.clear();
     expandedThinkingMembers.clear();
@@ -3157,6 +3295,8 @@ export default function prettyTui(pi: ExtensionAPI) {
       }
 
       if (message.role === "assistant") {
+        const answerText = assistantAnswerText(message);
+        if (answerText) responseAnswerTexts.set(entry.id, answerText);
         const thinking = thinkingText(message);
         if (thinking) {
           activityTimeline.addThinking(assistantMessageKey(message), thinking);
@@ -3306,6 +3446,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     trackPendingToolActivity(event.message);
   });
   pi.on("message_end", (event) => {
+    if (event.message?.role === "assistant") responseHasAssistantMessage = true;
     if (hasVisibleAssistantText(event.message)) {
       trackThinkingActivity(event.message);
       closeAtAssistantBoundary(event.message, "done");
@@ -3328,6 +3469,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     // count until the whole run reaches agent_settled.
     if (!cleanRun.active) {
       clearToolActivityHolds();
+      responseRunStartedAt = Date.now();
       cleanRun.count = 0;
       cleanRun.failed = 0;
       cleanRun.currentToolCallIds = [];
@@ -3336,6 +3478,9 @@ export default function prettyTui(pi: ExtensionAPI) {
       cleanRun.lastCompletedToolCallId = undefined;
       cleanRun.settled = false;
     }
+    // Retries share the original start time but only the newest low-level
+    // run may supply a candidate final answer.
+    responseHasAssistantMessage = false;
     cleanRun.active = true;
     cleanRun.activeToolCallIds.clear();
     cleanRun.activeToolCallId = undefined;
@@ -3389,7 +3534,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     cleanRun.activeToolName = undefined;
     cleanRun.activity = "thinking";
   });
-  pi.on("agent_settled", () => {
+  pi.on("agent_settled", (_event, ctx) => {
     if (cleanRun.settled) return;
 
     clearPendingToolActivities();
@@ -3410,6 +3555,30 @@ export default function prettyTui(pi: ExtensionAPI) {
     cleanRun.activeToolName = undefined;
     cleanRun.activity = "done";
     cleanRun.settled = true;
+
+    if (responseRunStartedAt !== undefined) {
+      // message_end runs before later extensions can replace the message and
+      // before Pi persists it. Read the committed branch at the final boundary
+      // so Copy matches the transcript even when another extension redacts it.
+      const finalEntry = responseHasAssistantMessage
+        ? ctx.sessionManager.getBranch().reverse().find(
+            (entry) => entry.type === "message" && entry.message.role === "assistant",
+          )
+        : undefined;
+      const answer = finalEntry && finalEntry.type === "message"
+        ? assistantAnswerText(finalEntry.message)
+        : "";
+      if (answer && finalEntry) responseAnswerTexts.set(finalEntry.id, answer);
+      pi.appendEntry<ResponseFooterData>(RESPONSE_FOOTER_ENTRY_TYPE, {
+        answerEntryId: answer ? finalEntry?.id : undefined,
+        durationMs: Math.max(0, Date.now() - responseRunStartedAt),
+        outcome: finalEntry?.type === "message" && assistantTerminalState(finalEntry.message)
+          ? "stopped"
+          : "completed",
+      });
+      responseRunStartedAt = undefined;
+      responseHasAssistantMessage = false;
+    }
 
     const groups = cleanRun.groups.slice();
     if (renderMode !== "clean" || groups.length === 0) return;
