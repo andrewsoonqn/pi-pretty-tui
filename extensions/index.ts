@@ -214,6 +214,8 @@ export default function prettyTui(pi: ExtensionAPI) {
   };
   const activityTimeline = new ActivityTimeline();
   const revealedActivityGroups = new Set<string>();
+  // A local collapse must still work when Ctrl+O has expanded every group.
+  const collapsedActivityGroups = new Set<string>();
   const expandedThinkingMembers = new Set<string>();
   const thinkingComponents = new Map<string, any>();
   const activityFallbackThemes = new Map<string, any>();
@@ -342,7 +344,8 @@ export default function prettyTui(pi: ExtensionAPI) {
   };
 
   const activityGroupRevealed = (group: ActivityGroup): boolean =>
-    cleanToolsExpanded || revealedActivityGroups.has(group.id);
+    !collapsedActivityGroups.has(group.id) &&
+    (cleanToolsExpanded || revealedActivityGroups.has(group.id));
 
   // A group is revealable once it owns anything renderable beneath its parent
   // row. Thinking counts on its own: a tool-free turn still gets a parent row
@@ -355,6 +358,67 @@ export default function prettyTui(pi: ExtensionAPI) {
     last: group.members[group.members.length - 1]?.id === member.id,
   });
 
+  const collapseLabel = "[↑ Collapse]";
+  const collapsePrefix = "  └─ ";
+  const renderActivityCollapse = (group: ActivityGroup, width: number): string => {
+    const theme = activityGroupTheme(group);
+    return truncateToWidth(
+      theme.fg("dim", collapsePrefix) + theme.fg("muted", collapseLabel),
+      Math.max(1, width),
+      "",
+    );
+  };
+  const withActivityCollapse = (
+    group: ActivityGroup,
+    member: ActivityMember,
+    width: number,
+    lines: string[],
+  ): string[] => activityMemberPosition(group, member).last && activityGroupRevealed(group)
+    ? [...lines, renderActivityCollapse(group, width)]
+    : lines;
+  const activityCollapseClicked = (
+    group: ActivityGroup,
+    member: ActivityMember,
+    event: any,
+    row: number,
+  ): boolean => activityGroupRevealed(group) &&
+    activityMemberPosition(group, member).last &&
+    event.type === "click" && event.button === "left" && event.y === row &&
+    event.x >= visibleWidth(collapsePrefix) &&
+    event.x < Math.min(event.width, visibleWidth(collapsePrefix + collapseLabel));
+
+  const refreshActivityGroup = (group: ActivityGroup): void => {
+    for (const child of group.members) {
+      if (child.kind === "tool" && child.toolCallId) {
+        cleanToolComponents.get(child.toolCallId)?.updateDisplay?.();
+      } else if (child.kind === "thinking" && child.messageKey) {
+        thinkingComponents.get(child.messageKey)?.invalidate?.();
+      } else if (child.kind === "update") {
+        activityUpdateComponents.get(child.id)?.invalidate?.();
+      }
+    }
+  };
+  const revealActivityGroup = (group: ActivityGroup, ui?: any): void => {
+    collapsedActivityGroups.delete(group.id);
+    revealedActivityGroups.add(group.id);
+    for (const toolCallId of group.toolCallIds) cleanCompactToolCallIds.add(toolCallId);
+    refreshActivityGroup(group);
+    (ui ?? currentTui)?.requestRender?.();
+  };
+  const collapseActivityGroup = (group: ActivityGroup, ui?: any): void => {
+    revealedActivityGroups.delete(group.id);
+    if (cleanToolsExpanded) collapsedActivityGroups.add(group.id);
+    else collapsedActivityGroups.delete(group.id);
+    for (const toolCallId of group.toolCallIds) {
+      cleanCompactToolCallIds.delete(toolCallId);
+      const component = cleanToolComponents.get(toolCallId);
+      if (component?.expanded) component.setExpanded(false);
+    }
+    for (const child of group.members) expandedThinkingMembers.delete(child.id);
+    refreshActivityGroup(group);
+    (ui ?? currentTui)?.requestRender?.();
+  };
+
   const activityTreeStyle = (
     group: ActivityGroup,
     member: ActivityMember,
@@ -362,8 +426,10 @@ export default function prettyTui(pi: ExtensionAPI) {
     memberTheme?: any,
   ) => {
     const { last } = activityMemberPosition(group, member);
-    const rawPrefix = last ? "  └─ " : "  ├─ ";
-    const rawContinuation = last ? "     " : "  │  ";
+    // While expanded, the collapse action is the final sibling in the tree.
+    const hasFollowingCollapse = last && activityGroupRevealed(group);
+    const rawPrefix = last && !hasFollowingCollapse ? "  └─ " : "  ├─ ";
+    const rawContinuation = last && !hasFollowingCollapse ? "     " : "  │  ";
     const prefixWidth = visibleWidth(rawPrefix);
     if (width <= prefixWidth) {
       return { prefix: "", continuation: "", childWidth: Math.max(1, width), prefixWidth: 0 };
@@ -450,9 +516,10 @@ export default function prettyTui(pi: ExtensionAPI) {
       truncateToWidth((index === 0 ? prefix : continuation) + line, Math.max(1, width), "")
     );
     const position = activityMemberPosition(group, member);
-    return position.first
-      ? ["", ...renderActivityGroupSummary(group, width), ...decorated]
-      : decorated;
+    return withActivityCollapse(
+      group, member, width,
+      position.first ? ["", ...renderActivityGroupSummary(group, width), ...decorated] : decorated,
+    );
   };
 
   const renderPendingActivityUpdate = (member: ActivityMember, width: number): string[] => {
@@ -495,29 +562,16 @@ export default function prettyTui(pi: ExtensionAPI) {
     const position = activityMemberPosition(group, member);
     if (!activityGroupRevealed(group)) {
       if (!position.first) return undefined;
-      revealedActivityGroups.add(group.id);
-      for (const toolCallId of group.toolCallIds) cleanCompactToolCallIds.add(toolCallId);
-    } else {
-      const summaryHeight = position.first ? renderActivityGroupSummary(group, event.width).length : 0;
-      if (!position.first || event.y <= 0 || event.y > summaryHeight) return undefined;
-      revealedActivityGroups.delete(group.id);
-      for (const toolCallId of group.toolCallIds) {
-        cleanCompactToolCallIds.delete(toolCallId);
-        const component = cleanToolComponents.get(toolCallId);
-        if (component?.expanded) component.setExpanded(false);
-      }
-      for (const child of group.members) expandedThinkingMembers.delete(child.id);
+      revealActivityGroup(group);
+      return { handled: true };
     }
-    for (const child of group.members) {
-      if (child.kind === "tool" && child.toolCallId) {
-        cleanToolComponents.get(child.toolCallId)?.updateDisplay?.();
-      } else if (child.kind === "thinking" && child.messageKey) {
-        thinkingComponents.get(child.messageKey)?.invalidate?.();
-      } else if (child.kind === "update") {
-        activityUpdateComponents.get(child.id)?.invalidate?.();
-      }
-    }
-    currentTui?.requestRender?.();
+    const summaryHeight = position.first ? renderActivityGroupSummary(group, event.width).length : 0;
+    const onSummary = position.first && event.y > 0 && event.y <= summaryHeight;
+    const onCollapse = position.last && activityCollapseClicked(
+      group, member, event, renderActivityUpdate(group, member, event.width).length - 1,
+    );
+    if (!onSummary && !onCollapse) return undefined;
+    collapseActivityGroup(group);
     return { handled: true };
   };
 
@@ -606,6 +660,7 @@ export default function prettyTui(pi: ExtensionAPI) {
 
       cleanCompactToolCallIds.clear();
       revealedActivityGroups.clear();
+      collapsedActivityGroups.clear();
       expandedThinkingMembers.clear();
       renderMode = requested;
       if (renderMode === "clean") refreshLatestActivityWidget();
@@ -1015,15 +1070,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       );
 
     const refreshGroup = (group: ActivityGroup) => {
-      for (const member of group.members) {
-        if (member.kind === "tool" && member.toolCallId) {
-          cleanToolComponents.get(member.toolCallId)?.updateDisplay?.();
-        } else if (member.kind === "thinking" && member.messageKey) {
-          thinkingComponents.get(member.messageKey)?.invalidate?.();
-        } else if (member.kind === "update") {
-          activityUpdateComponents.get(member.id)?.invalidate?.();
-        }
-      }
+      refreshActivityGroup(group);
       currentTui?.requestRender?.();
     };
 
@@ -1189,9 +1236,10 @@ export default function prettyTui(pi: ExtensionAPI) {
       const decorated = contentLines.map((line, index) =>
         truncateToWidth((index === 0 ? prefix : continuation) + line, Math.max(1, width), "")
       );
-      const output = position.first
-        ? ["", ...renderActivityGroupSummary(group, width), ...decorated]
-        : decorated;
+      const output = withActivityCollapse(
+        group, member, width,
+        position.first ? ["", ...renderActivityGroupSummary(group, width), ...decorated] : decorated,
+      );
       if (cacheable) {
         this[cleanThinkingRenderCacheKey] = {
           width,
@@ -1232,10 +1280,11 @@ export default function prettyTui(pi: ExtensionAPI) {
       // visible Markdown. The Markdown is rendered after the activity rows;
       // route clicks in that suffix back to Pi's native component so links,
       // text selection, and code-block Copy controls keep working.
+      let activityHeight: number | undefined;
       if (visibleAssistantText(message)) {
         const visibleLines = originalRender.call(this, event.width);
         const renderedLines = patchedRender.call(this, event.width);
-        const activityHeight = Math.max(0, renderedLines.length - visibleLines.length);
+        activityHeight = Math.max(0, renderedLines.length - visibleLines.length);
         if (event.y >= activityHeight) {
           return originalHandleMouse.call(this, {
             ...event,
@@ -1247,25 +1296,21 @@ export default function prettyTui(pi: ExtensionAPI) {
 
       if (!activityGroupRevealed(group)) {
         if (!isLeftClick) return undefined;
-        if (position.first) {
-          revealedActivityGroups.add(group.id);
-          for (const toolCallId of group.toolCallIds) cleanCompactToolCallIds.add(toolCallId);
-          refreshGroup(group);
-        }
+        if (position.first) revealActivityGroup(group);
         return { handled: true };
       }
       const summaryHeight = position.first ? renderActivityGroupSummary(group, event.width).length : 0;
-      if (position.first && event.y > 0 && event.y <= summaryHeight && isLeftClick) {
-        revealedActivityGroups.delete(group.id);
-        for (const toolCallId of group.toolCallIds) {
-          cleanCompactToolCallIds.delete(toolCallId);
-          const component = cleanToolComponents.get(toolCallId);
-          if (component?.expanded) component.setExpanded(false);
-        }
-        for (const child of group.members) expandedThinkingMembers.delete(child.id);
-        refreshGroup(group);
+      const collapseRow = position.last
+        ? (activityHeight ?? patchedRender.call(this, event.width).length) - 1
+        : -1;
+      if (
+        (position.first && event.y > 0 && event.y <= summaryHeight && isLeftClick) ||
+        activityCollapseClicked(group, member, event, collapseRow)
+      ) {
+        collapseActivityGroup(group);
         return { handled: true };
       }
+      if (position.last && event.y === collapseRow) return undefined;
       if (isLeftClick) {
         if (expandedThinkingMembers.has(member.id)) expandedThinkingMembers.delete(member.id);
         else expandedThinkingMembers.add(member.id);
@@ -1390,6 +1435,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     const originalShowError = interactiveModePrototype.showError;
     const patchedSetToolsExpanded = function (this: any, expanded: boolean) {
       cleanToolsExpanded = expanded;
+      collapsedActivityGroups.clear();
       changingAllToolsExpansion = true;
       if (!expanded) {
         cleanCompactToolCallIds.clear();
@@ -2426,32 +2472,8 @@ export default function prettyTui(pi: ExtensionAPI) {
     const originalToolHandleMouse = toolExecutionPrototype.handleMouse;
     const renderedModeKey = Symbol("pretty-tui.tool-rendered-mode");
     const cleanChildRenderCacheKey = Symbol("pretty-tui.clean-child-render-cache");
-    const refreshActivityGroup = (group: ActivityGroup) => {
-      for (const member of group.members) {
-        if (member.kind === "tool" && member.toolCallId) {
-          cleanToolComponents.get(member.toolCallId)?.updateDisplay();
-        } else if (member.kind === "thinking" && member.messageKey) {
-          thinkingComponents.get(member.messageKey)?.invalidate?.();
-        }
-      }
-    };
-    const revealCleanGroup = (group: ActivityGroup, ui?: any) => {
-      revealedActivityGroups.add(group.id);
-      for (const toolCallId of group.toolCallIds) cleanCompactToolCallIds.add(toolCallId);
-      refreshActivityGroup(group);
-      ui?.requestRender?.();
-    };
-    const collapseCleanGroup = (group: ActivityGroup, ui?: any) => {
-      revealedActivityGroups.delete(group.id);
-      for (const toolCallId of group.toolCallIds) {
-        const component = cleanToolComponents.get(toolCallId);
-        if (component?.expanded) originalSetExpanded.call(component, false);
-        cleanCompactToolCallIds.delete(toolCallId);
-      }
-      for (const member of group.members) expandedThinkingMembers.delete(member.id);
-      refreshActivityGroup(group);
-      ui?.requestRender?.();
-    };
+    const revealCleanGroup = revealActivityGroup;
+    const collapseCleanGroup = collapseActivityGroup;
     const patchedMarkExecutionStarted = function (this: any) {
       activityTimeline.addTool(this.toolCallId, this.toolName);
       if (!cleanRun.currentToolCallIds.includes(this.toolCallId)) {
@@ -2512,7 +2534,11 @@ export default function prettyTui(pi: ExtensionAPI) {
         continuation,
         childWidth,
       } = activityTreeStyle(group, member, width, childTheme);
-      const thirdParty = !SPECIALIZED_TOOL_NAMES.has(this.toolName);
+      // Other extensions (notably FFF in override mode) can register their own
+      // grep/find renderers under built-in names. Their default boxed shell is
+      // not one of our self-rendering specialized tools.
+      const thirdParty = !SPECIALIZED_TOOL_NAMES.has(this.toolName) ||
+        this.toolDefinition?.renderShell !== "self";
       const cacheable = !this.expanded && Boolean(this.result) && !this.isPartial;
       const cached = cacheable ? this[cleanChildRenderCacheKey] : undefined;
       let decoratedContent: string[];
@@ -2578,8 +2604,10 @@ export default function prettyTui(pi: ExtensionAPI) {
           };
         }
       }
-      if (!position.first) return decoratedContent;
-      return ["", ...renderActivityGroupSummary(group, width), ...decoratedContent];
+      return withActivityCollapse(
+        group, member, width,
+        position.first ? ["", ...renderActivityGroupSummary(group, width), ...decoratedContent] : decoratedContent,
+      );
     };
     const patchedToolHandleMouse = function (this: any, event: any) {
       const member = activityTimeline.memberForTool(this.toolCallId);
@@ -2598,7 +2626,11 @@ export default function prettyTui(pi: ExtensionAPI) {
       if (!revealed) return isLeftClick ? { handled: true } : undefined;
 
       const summaryHeight = position.first ? renderActivityGroupSummary(group, event.width).length : 0;
-      if (position.first && event.y > 0 && event.y <= summaryHeight && isLeftClick) {
+      const onSummary = position.first && event.y > 0 && event.y <= summaryHeight && isLeftClick;
+      const onCollapse = position.last && activityCollapseClicked(
+        group, member, event, patchedToolRender.call(this, event.width).length - 1,
+      );
+      if (onSummary || onCollapse) {
         changingAllToolsExpansion = true;
         try {
           collapseCleanGroup(group, this.ui);
@@ -2612,7 +2644,7 @@ export default function prettyTui(pi: ExtensionAPI) {
       // replaces that spacer with the compact header for non-first members.
       const thirdPartyHeaderY = position.first ? summaryHeight + 1 : 0;
       if (
-        !SPECIALIZED_TOOL_NAMES.has(this.toolName) &&
+        (!SPECIALIZED_TOOL_NAMES.has(this.toolName) || this.toolDefinition?.renderShell !== "self") &&
         isLeftClick &&
         event.y === thirdPartyHeaderY
       ) {
@@ -3074,6 +3106,7 @@ export default function prettyTui(pi: ExtensionAPI) {
     responseHasAssistantMessage = false;
     nativeCustomBoundaryKeys.clear();
     revealedActivityGroups.clear();
+    collapsedActivityGroups.clear();
     expandedThinkingMembers.clear();
     thinkingComponents.clear();
     activityFallbackThemes.clear();

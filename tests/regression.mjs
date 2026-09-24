@@ -832,10 +832,106 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   const restoredCustomText = restoredCustom.render(80).join("\n")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
   assert.ok(restoredCustomText.includes("├─"), restoredCustomText);
-  assert.ok(!restoredCustomText.includes("└─"), restoredCustomText);
+  assert.ok(!restoredCustomText.includes("[↑ Collapse]"), restoredCustomText);
   assert.ok(restoredCustomText.includes("Web Search Content Ready"));
   assert.ok(restoredCustomText.includes("Content fetched for 1/2 URLs"));
   assert.ok(!restoredCustomText.includes("[web-search-content-ready]"));
+
+  // The final tool continues the same tree; the synthetic collapse action is
+  // its last sibling, not a disconnected divider or a persisted session entry.
+  const tailTool = new ToolExecutionComponent(
+    "obs_recall", "restored-custom-tail", {}, undefined,
+    { renderShell: "self", renderCall: () => new Text("tail", 0, 0) },
+    { requestRender() {} }, process.cwd(),
+  );
+  tailTool.markExecutionStarted();
+  const expandedTailLines = tailTool.render(80).map(stripTerminalSequences);
+  const collapseY = expandedTailLines.findIndex((line) => line.includes("[↑ Collapse]"));
+  assert.ok(expandedTailLines.some((line) => line.includes("├─") && line.includes("obs_recall")), expandedTailLines.join("\n"));
+  assert.equal(collapseY, expandedTailLines.length - 1);
+  assert.equal(expandedTailLines[collapseY], "  └─ [↑ Collapse]");
+  assert.ok(!headTool.render(80).join("\n").includes("[↑ Collapse]"));
+  assert.equal(tailTool.handleMouse({
+    type: "click", button: "left", x: 7, y: collapseY,
+    width: 80, height: expandedTailLines.length,
+  })?.handled, true);
+  assert.match(headTool.render(80).map(stripTerminalSequences).join("\n"), /(?:Running|Done)\(/);
+  assert.equal(tailTool.render(80).length, 0);
+  assert.equal(restoredCustom.render(80).length, 0);
+  // The original header remains an independent way to reopen this group.
+  headTool.handleMouse({
+    type: "click", button: "left", x: 1, y: 1, width: 80, height: headTool.render(80).length,
+  });
+  assert.ok(tailTool.render(80).map(stripTerminalSequences).join("\n").includes("└─ [↑ Collapse]"));
+}
+
+// A group can be collapsed locally even after Ctrl+O expands the whole
+// transcript; its sibling group remains open and the parent can reopen it.
+{
+  const entries = [
+    assistant("46", null, [{ id: "global-first", name: "obs_recall" }]),
+    result("47", "46", "global-first"),
+    user("48", "47"),
+    assistant("49", "48", [{ id: "global-second", name: "obs_recall" }]),
+    result("50", "49", "global-second"),
+  ];
+  const context = sessionContext(entries);
+  context.ui.getToolsExpanded = () => true;
+  await emit("session_start", {}, context);
+  const makeTool = (id) => {
+    const tool = new ToolExecutionComponent(
+      "obs_recall", id, {}, undefined,
+      { renderShell: "self", renderCall: () => new Text(id, 0, 0) },
+      { requestRender() {} }, process.cwd(),
+    );
+    tool.markExecutionStarted();
+    return tool;
+  };
+  const first = makeTool("global-first");
+  const second = makeTool("global-second");
+  const firstLines = first.render(80).map(stripTerminalSequences);
+  assert.equal(firstLines.at(-1), "  └─ [↑ Collapse]");
+  assert.ok(second.render(80).join("\n").includes("[↑ Collapse]"));
+  first.handleMouse({
+    type: "click", button: "left", x: 7, y: firstLines.length - 1,
+    width: 80, height: firstLines.length,
+  });
+  assert.ok(!first.render(80).join("\n").includes("[↑ Collapse]"));
+  assert.ok(second.render(80).join("\n").includes("[↑ Collapse]"));
+  first.handleMouse({
+    type: "click", button: "left", x: 1, y: 1, width: 80, height: first.render(80).length,
+  });
+  assert.ok(first.render(80).join("\n").includes("[↑ Collapse]"));
+}
+
+// While a Running group grows, move the one collapse action from the previous
+// last tool to the new last tool without leaving a dangling terminal branch.
+{
+  await emit("session_start", {}, sessionContext([]));
+  await emit("agent_start");
+  const makeTool = (id) => {
+    const tool = new ToolExecutionComponent(
+      "obs_recall", id, {}, undefined,
+      { renderShell: "self", renderCall: () => new Text(id, 0, 0) },
+      { requestRender() {} }, process.cwd(),
+    );
+    tool.markExecutionStarted();
+    return tool;
+  };
+  const first = makeTool("stream-first");
+  first.handleMouse({
+    type: "click", button: "left", x: 1, y: 1, width: 80, height: first.render(80).length,
+  });
+  assert.equal(first.render(80).map(stripTerminalSequences).at(-1), "  └─ [↑ Collapse]");
+  const second = makeTool("stream-second");
+  const oldLast = first.render(80).map(stripTerminalSequences).join("\n");
+  const newLast = second.render(80).map(stripTerminalSequences);
+  assert.ok(oldLast.includes("  ├─ ") && !oldLast.includes("[↑ Collapse]"), oldLast);
+  assert.equal(newLast.at(-1), "  └─ [↑ Collapse]");
+  for (const width of [1, 4, 8, 12]) {
+    assert.ok([...first.render(width), ...second.render(width)]
+      .every((line) => visibleWidth(line) <= width));
+  }
 }
 
 // A tool's own output text must never decide whether it failed. Pi supplies the
@@ -987,7 +1083,8 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   assert.ok(compactToolText.includes("├─") && compactToolText.includes("● Recall Observation"));
   assert.ok(compactToolText.includes("ok"));
   assert.ok(infoUpdateText.includes("◇ Footer info"));
-  assert.ok(!customUpdate.includes("└─") && customUpdate.includes("Web Search Content Ready"));
+  assert.ok(customUpdate.includes("Web Search Content Ready"));
+  assert.ok(!customUpdate.includes("[↑ Collapse]"), customUpdate);
   assert.ok(customUpdate.includes("Content fetched for 2/3 URLs"));
   assert.ok(customUpdate.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").includes("└ Content fetched"));
   assert.ok(!/\x1b\[(?:4[0-9]|10[0-7]|48(?:;|:))/u.test(customUpdate));
@@ -1045,6 +1142,35 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     ];
     assert.ok(lines.every((line) => visibleWidth(line) <= width));
   }
+}
+
+// FFF can override the built-in names grep/find with default-shell renderers.
+// A tool's name alone must not cause its boxed renderer to leak into the
+// compact activity tree; clicking the child still exposes native details.
+for (const name of ["find", "grep"]) {
+  await emit("session_start", {}, sessionContext([]));
+  await emit("agent_start");
+  const tool = new ToolExecutionComponent(
+    name, `fff-${name}`, { pattern: "release", path: "src/" }, undefined,
+    {
+      label: name,
+      renderCall: (_args, toolTheme) => new Text(toolTheme.fg("accent", `Native boxed ${name}`), 0, 0),
+      renderResult: () => new Text(`Native ${name} results`, 0, 0),
+    },
+    { requestRender() {} }, process.cwd(),
+  );
+  tool.markExecutionStarted();
+  tool.updateResult({ content: [{ type: "text", text: `${name} match` }], isError: false });
+  tool.handleMouse({
+    type: "click", button: "left", x: 1, y: 1, width: 80, height: tool.render(80).length,
+  });
+  const compactLines = tool.render(80).map(stripTerminalSequences);
+  assert.ok(compactLines.some((line) => line.includes(`├─ ● ${name}`)), compactLines.join("\n"));
+  assert.ok(!compactLines.join("\n").includes(`Native boxed ${name}`));
+  assert.equal(compactLines.at(-1), "  └─ [↑ Collapse]");
+  const childY = compactLines.findIndex((line) => line.includes(`● ${name}`));
+  tool.handleMouse({ type: "click", button: "left", x: 8, y: childY, width: 80, height: compactLines.length });
+  assert.ok(tool.render(80).map(stripTerminalSequences).join("\n").includes(`Native boxed ${name}`));
 }
 
 // A failed attempt can leave its Thinking block outside its completed activity
@@ -1246,6 +1372,15 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   assert.ok(revealedThoughtOnly.includes("Plugin Event"));
   assert.ok(revealedThoughtOnly.includes("Renderer-less"));
   assert.ok(!revealedThoughtOnly.includes("**"));
+  const customLines = thoughtOnlyCustom.render(80).map(stripTerminalSequences);
+  assert.equal(customLines.at(-1), "  └─ [↑ Collapse]");
+  assert.ok(customLines.some((line) => line.startsWith("  ├─ ") && line.includes("Plugin Event")));
+  assert.equal(thoughtOnlyCustom.handleMouse({
+    type: "click", button: "left", x: 7, y: customLines.length - 1,
+    width: 80, height: customLines.length,
+  })?.handled, true);
+  assert.ok(!renderThoughtOnly().includes("Plugin Event"));
+  assert.ok(!renderThoughtOnly().includes("Indexing complete"));
 }
 
 // Regression: a turn that produces a thought and no tool call still gets the
@@ -1291,7 +1426,8 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
     type: "click", button: "left", x: 1, y: 1, width: 80, height: turnComponent.render(80).length,
   });
   const revealedTurn = renderTurn();
-  assert.ok(revealedTurn.includes("└─ ● thought"), revealedTurn);
+  assert.ok(revealedTurn.includes("├─ ● thought"), revealedTurn);
+  assert.ok(revealedTurn.includes("└─ [↑ Collapse]"), revealedTurn);
   assert.ok(revealedTurn.includes("Final answer text"));
   assert.ok(!revealedTurn.includes("Thought that must survive"));
 
@@ -1301,6 +1437,16 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   const expandedTurn = renderTurn();
   assert.ok(expandedTurn.includes("Thought that must survive"), expandedTurn);
   assert.ok(expandedTurn.includes("Final answer text"));
+  const turnLines = turnComponent.render(80).map(stripTerminalSequences);
+  const turnCollapseY = turnLines.findIndex((line) => line.includes("[↑ Collapse]"));
+  assert.ok(turnCollapseY >= 0 && turnCollapseY < turnLines.findIndex((line) => line.includes("Final answer text")));
+  assert.equal(turnComponent.handleMouse({
+    type: "click", button: "left", x: 7, y: turnCollapseY,
+    width: 80, height: turnLines.length,
+  })?.handled, true);
+  assert.ok(!renderTurn().includes("Thought that must survive"));
+  assert.ok(!renderTurn().includes("[↑ Collapse]"));
+  assert.ok(renderTurn().includes("Final answer text"));
 
   // A thought with neither tool calls nor visible text must still render.
   await emit("session_start", {}, sessionContext([]));
