@@ -188,6 +188,7 @@ export default function prettyTui(pi: ExtensionAPI) {
   type ResponseFooterData = {
     answerEntryId?: string;
     durationMs: number;
+    finishedAt?: number;
     outcome: "completed" | "stopped";
   };
   const responseAnswerTexts = new Map<string, string>();
@@ -3003,9 +3004,14 @@ export default function prettyTui(pi: ExtensionAPI) {
         const copyLabel = "[Copy]";
         const showCopy = fullscreenTui && Boolean(answer.trim()) && width >= 30;
         const duration = formatResponseDuration(data.durationMs);
-        const statusText = data.outcome === "stopped"
+        const finishedAt = data.finishedAt === undefined ? undefined : new Date(data.finishedAt);
+        const time = finishedAt && Number.isFinite(finishedAt.getTime())
+          ? `${finishedAt.getHours() % 12 || 12}:${String(finishedAt.getMinutes()).padStart(2, "0")}${finishedAt.getHours() < 12 ? "am" : "pm"}`
+          : "";
+        const status = data.outcome === "stopped"
           ? `⚠ Stopped after ${duration}`
-          : `✓ Completed in ${duration}`;
+          : `✓ ${duration}`;
+        const statusText = time ? `${status} · ${time}` : status;
         const leading = "── ";
         const trailing = showCopy ? ` ${copyLabel} ──` : "──";
         const fixedWidth = visibleWidth(leading) + visibleWidth(trailing) + 1;
@@ -3602,9 +3608,11 @@ export default function prettyTui(pi: ExtensionAPI) {
         ? assistantAnswerText(finalEntry.message)
         : "";
       if (answer && finalEntry) responseAnswerTexts.set(finalEntry.id, answer);
+      const finishedAt = Date.now();
       pi.appendEntry<ResponseFooterData>(RESPONSE_FOOTER_ENTRY_TYPE, {
         answerEntryId: answer ? finalEntry?.id : undefined,
-        durationMs: Math.max(0, Date.now() - responseRunStartedAt),
+        durationMs: Math.max(0, finishedAt - responseRunStartedAt),
+        finishedAt,
         outcome: finalEntry?.type === "message" && assistantTerminalState(finalEntry.message)
           ? "stopped"
           : "completed",

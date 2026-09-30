@@ -1710,6 +1710,7 @@ for (const name of ["find", "grep"]) {
   assert.deepEqual(footerEntry.data, {
     answerEntryId: "footer-answer",
     durationMs: 65_000,
+    finishedAt: 66_000,
     outcome: "completed",
   });
   assert.equal("answer" in footerEntry.data, false);
@@ -1738,7 +1739,28 @@ for (const name of ["find", "grep"]) {
   };
   const liveFooter = renderFooter();
   assert.equal(liveFooter.plain.length, 1);
-  assert.ok(liveFooter.plain[0].startsWith("── ✓ Completed in 1m 5s "), liveFooter.plain[0]);
+  const formatLocalTime = (timestamp) => new Date(timestamp)
+    .toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true })
+    .replace(/\s/g, "").toLowerCase();
+  assert.ok(liveFooter.plain[0].startsWith(`── ✓ 1m 5s · ${formatLocalTime(66_000)} `), liveFooter.plain[0]);
+  const shortFooter = renderFooter({
+    ...footerEntry,
+    data: { ...footerEntry.data, durationMs: 6_000, finishedAt: new Date(2026, 8, 15, 16, 26).getTime() },
+  });
+  assert.ok(shortFooter.plain[0].startsWith("── ✓ 6s · 4:26pm "), shortFooter.plain[0]);
+  const { finishedAt, ...legacyData } = footerEntry.data;
+  const legacyFooter = renderFooter({ ...footerEntry, data: legacyData });
+  assert.ok(legacyFooter.plain[0].startsWith("── ✓ 1m 5s "), legacyFooter.plain[0]);
+  assert.ok(!legacyFooter.plain[0].includes(" · "), legacyFooter.plain[0]);
+  for (const hour of [0, 9, 12, 21, 23]) {
+    const timestamp = new Date(2026, 8, 15, hour, 5).getTime();
+    const rendered = renderFooter({ ...footerEntry, data: { ...footerEntry.data, finishedAt: timestamp } });
+    assert.ok(rendered.plain[0].includes(` · ${formatLocalTime(timestamp)} `), rendered.plain[0]);
+  }
+  for (let width = 1; width <= 100; width++) {
+    const rendered = renderFooter(footerEntry, width);
+    assert.ok(rendered.lines.every((line) => visibleWidth(line) <= width), `Footer exceeds width ${width}`);
+  }
   assert.ok(liveFooter.plain[0].endsWith(" [Copy] ──"), liveFooter.plain[0]);
   const copyX = liveFooter.plain[0].indexOf("[Copy]") + 1;
   assert.ok(copyX > 0, liveFooter.plain[0]);
@@ -1788,6 +1810,7 @@ for (const name of ["find", "grep"]) {
   };
   await emit("session_start", {}, sessionContext([olderAnswer, olderFooter, restoredAnswer, restoredFooter]));
   const afterReload = renderFooter();
+  assert.deepEqual(afterReload.plain, liveFooter.plain);
   assert.ok(afterReload.plain[0].includes("[Copy]"), afterReload.plain[0]);
   const clickFooter = (rendered) => {
     const x = rendered.plain[0].indexOf("[Copy]") + 1;
@@ -1823,12 +1846,20 @@ for (const name of ["find", "grep"]) {
   };
   await emit("message_end", { message: terminalMessage });
   stoppedBranch.push({ type: "message", id: "aborted", parentId: "interim", message: terminalMessage });
-  await emit("agent_settled", {}, stoppedContext);
+  const stoppedAt = new Date(2026, 8, 15, 21, 42).getTime();
+  Date.now = () => stoppedAt;
+  try {
+    await emit("agent_settled", {}, stoppedContext);
+  } finally {
+    Date.now = originalNow;
+  }
   const stoppedEntry = appendedEntries.find((entry) => entry.type === "pretty-tui-response-footer");
+  assert.equal(stoppedEntry.data.finishedAt, stoppedAt);
   assert.equal(stoppedEntry.data.outcome, "stopped");
   assert.equal(stoppedEntry.data.answerEntryId, undefined);
   const stopped = renderFooter(stoppedEntry);
   assert.ok(stopped.plain[0].includes("⚠ Stopped after"), stopped.plain[0]);
+  assert.ok(stopped.plain[0].includes(" · 9:42pm "), stopped.plain[0]);
   assert.ok(!stopped.plain[0].includes("[Copy]"), stopped.plain[0]);
 
   const footerColors = [];
