@@ -224,6 +224,69 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   for (const line of narrowLines) assert.equal(visibleWidth(line), 20, line);
 }
 
+// User Copy follows the native message mouse route and preserves source text.
+{
+  await emit("session_start", {}, sessionContext([]));
+  const copies = [];
+  const bindUi = (mode) => {
+    try {
+      InteractiveMode.prototype.renderSessionEntries.call({ ui: {
+        mode,
+        async copyTextToClipboard(text) { copies.push(text); return true; },
+      } }, []);
+    } catch {}
+  };
+  bindUi("fullscreen");
+  const prompt = "  **检查 👩‍💻**\n\n```ts\n  const value = 42;\n```\n\n" + "Long wrapped text with 中文. ".repeat(12) + "\n  ";
+  const bubble = new UserMessageComponent(prompt);
+  for (const width of [80, 42, 20, 12]) {
+    const lines = bubble.render(width).map(stripTerminalSequences);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width), `User Copy exceeds width ${width}`);
+    const x = lines.at(-1).lastIndexOf("╯") - 2;
+    assert.ok(x >= 0, lines.at(-1));
+    assert.ok(!lines[0].includes("⧉"));
+    assert.ok(lines.at(-1).trimEnd().endsWith("───╯"));
+    assert.ok(!lines.join("\n").includes("⧉"));
+    const event = { button: "left", x, y: lines.length - 1, width, height: lines.length };
+    assert.equal(bubble.handleMouse({ ...event, type: "press" })?.handled, true);
+    assert.equal(copies.length, [80, 42, 20, 12].indexOf(width));
+    assert.equal(bubble.handleMouse({ ...event, type: "click" })?.handled, true);
+    assert.equal(copies.at(-1), prompt);
+    for (const clickX of [x - 1, x + 1]) {
+      assert.equal(bubble.handleMouse({ ...event, type: "press", x: clickX })?.handled, true);
+    }
+    assert.equal(bubble.handleMouse({ ...event, type: "click", button: "right" })?.handled, undefined);
+    assert.equal(bubble.handleMouse({ ...event, type: "click", x: x - 2 })?.handled, undefined);
+    assert.equal(bubble.handleMouse({ ...event, type: "click", x: x + 2 })?.handled, undefined);
+    assert.equal(bubble.handleMouse({ ...event, type: "click", y: 0 })?.handled, undefined);
+  }
+  const short = new UserMessageComponent("x");
+  assert.ok(!stripTerminalSequences(short.render(80).at(-1)).includes("⧉"));
+  short.setOutputPad(3);
+  const rebuilt = short.render(42).map(stripTerminalSequences);
+  assert.equal(short.handleMouse({ type: "click", button: "left", x: rebuilt.at(-1).lastIndexOf("╯") - 2,
+    y: rebuilt.length - 1, width: 42, height: rebuilt.length })?.handled, true);
+  assert.equal(copies.at(-1), "x");
+  short.setOutputPad(1);
+  for (let width = 7; width <= 100; width++) {
+    const lines = short.render(width);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width), `Short user Copy exceeds width ${width}: ${JSON.stringify(lines.map((line) => [visibleWidth(line), stripTerminalSequences(line)]))}`);
+  }
+  for (let width = 1; width < 7; width++) {
+    assert.ok(!stripTerminalSequences(short.render(width).at(-1)).includes("⧉"));
+  }
+  assert.ok(!stripTerminalSequences(new UserMessageComponent("   ").render(80).at(-1)).includes("⧉"));
+  const fullscreenLines = bubble.render(80);
+  bindUi("regular");
+  const regularLines = bubble.render(80);
+  assert.deepEqual(regularLines, fullscreenLines, "Copy must not change message appearance");
+  assert.equal(bubble.handleMouse({ type: "click", button: "left",
+    x: stripTerminalSequences(regularLines.at(-1)).lastIndexOf("╯") - 2,
+    y: regularLines.length - 1, width: 80, height: regularLines.length })?.handled, undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(copies, [prompt, prompt, prompt, prompt, "x"]);
+}
+
 // The transcript-first model keeps thinking, tools, and updates in order
 // across explicit transcript boundaries.
 {

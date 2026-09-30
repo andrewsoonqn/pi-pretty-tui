@@ -778,6 +778,8 @@ export default function prettyTui(pi: ExtensionAPI) {
 
       const outputPad = Math.max(0, Number(this.outputPad) || 0);
       const markdownTheme = this.markdownTheme;
+      const promptText = this.text;
+      const copyTargetWidth = 3;
       // Markdown deliberately pads every rendered line to the requested width.
       // Remove only that trailing layout padding before measuring or framing;
       // ANSI styling and the visible content remain untouched.
@@ -815,12 +817,14 @@ export default function prettyTui(pi: ExtensionAPI) {
           ...measuredBody.map((line: string) => visibleWidth(line)),
         );
         const frameWidth = Math.min(frameMaximum, naturalContentWidth + 4);
+        const showCopy = fullscreenTui && Boolean(promptText?.trim()) && frameWidth >= copyTargetWidth + 2;
         const contentWidth = Math.max(1, frameWidth - 4);
         const body = contentWidth === measuringWidth
           ? measuredBody
           : renderMarkdown(contentWidth);
         return {
           framed: true,
+          showCopy,
           rightPad,
           leftPad: Math.max(0, terminalWidth - rightPad - frameWidth),
           frameWidth,
@@ -849,8 +853,21 @@ export default function prettyTui(pi: ExtensionAPI) {
           return [top, ...body, bottom].map((line: string) => left + line + right);
         },
         handleMouse(event: any) {
-          if (!markdown.handleMouse) return undefined;
           const measured = layout(event.width);
+          if (measured.framed && measured.showCopy) {
+            const copyStart = measured.leftPad + measured.frameWidth - copyTargetWidth - 1;
+            if (
+              event.button === "left" &&
+              (event.type === "press" || event.type === "click") &&
+              event.y === measured.body.length + 1 &&
+              event.x >= copyStart &&
+              event.x < copyStart + copyTargetWidth
+            ) {
+              if (event.type === "click") copyTranscriptText(promptText);
+              return { handled: true, render: false };
+            }
+          }
+          if (!markdown.handleMouse) return undefined;
           if (!measured.framed) {
             return withTranscriptMarkdown(() => markdown.handleMouse({
               ...event,
