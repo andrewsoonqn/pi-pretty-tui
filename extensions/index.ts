@@ -765,16 +765,18 @@ export default function prettyTui(pi: ExtensionAPI) {
       const content = this.children?.[0] as any;
       if (!content) return;
 
-      // Remove Pi's full-width user-message background. The Markdown keeps its
-      // native foreground styling, while the surrounding bubble stays transparent.
+      // Older Pi versions put the user background on a Box; newer versions put
+      // it directly on Markdown. Clear both while preserving foreground styles.
       content.paddingX = 0;
       content.paddingY = 0;
       content.setBgFn?.(undefined);
       content.invalidate?.();
-      // Pi wraps the Markdown in a full-width Box. Render the Markdown child
-      // directly so short messages expose their natural visible width instead
-      // of inheriting the Box's width-filling padding.
+      // Bypass the legacy Box so short messages retain their natural width.
       const markdown = content.children?.[0] ?? content;
+      if (markdown.defaultTextStyle?.bgColor) {
+        markdown.defaultTextStyle = { ...markdown.defaultTextStyle, bgColor: undefined };
+        markdown.invalidate?.();
+      }
 
       const outputPad = Math.max(0, Number(this.outputPad) || 0);
       const markdownTheme = this.markdownTheme;

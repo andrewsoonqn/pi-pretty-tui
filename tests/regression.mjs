@@ -22,6 +22,26 @@ const agentDir = mkdtempSync(join(tmpdir(), "pi-pretty-tui-test-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
 initTheme("dark", false);
 
+// Exercise both Pi's legacy Box wrapper and its direct-Markdown user renderer.
+let directMarkdownUserMessages = false;
+const nativeUserMessageRebuild = UserMessageComponent.prototype.rebuild;
+UserMessageComponent.prototype.rebuild = function () {
+  nativeUserMessageRebuild.call(this);
+  if (!directMarkdownUserMessages) return;
+  const content = this.children[0];
+  const markdown = content instanceof Markdown ? content : content.children[0];
+  markdown.paddingX = this.outputPad;
+  markdown.paddingY = 1;
+  markdown.defaultTextStyle = {
+    ...markdown.defaultTextStyle,
+    color: (text) => `\x1b[38;2;200;210;220m${text}\x1b[39m`,
+    bgColor: (text) => `\x1b[48;2;20;30;40m${text}\x1b[49m`,
+  };
+  markdown.invalidate();
+  this.clear();
+  this.addChild(markdown);
+};
+
 // Snapshots taken before the extension is loaded so session_shutdown can be
 // checked for a complete restore of every patched method.
 const originalPrototypeMethods = [
@@ -222,6 +242,30 @@ const counts = (visible) => visible.map(({ output }) => Number(/Done\((\d+) tool
   const narrowLines = plainLines(longBubble, 20);
   assert.ok(frameBounds(narrowLines[0]).start >= 1, narrowLines[0]);
   for (const line of narrowLines) assert.equal(visibleWidth(line), 20, line);
+}
+
+// Direct-Markdown backgrounds must be removed without losing foreground styles,
+// including after a rebuild and across narrow and wide terminal layouts.
+{
+  directMarkdownUserMessages = true;
+  try {
+    const bubble = new UserMessageComponent(
+      "A **bold** user prompt with 中文 and a [link](https://example.com). ".repeat(4),
+    );
+    for (const outputPad of [1, 3]) {
+      bubble.setOutputPad(outputPad);
+      for (const width of [20, 80, 120]) {
+        const raw = bubble.render(width).join("\n");
+        assert.ok(!/\x1b\[(?:[\d;]*;)?(?:48[;:][\d;:]+|4[0-7]|10[0-7])m/u.test(raw),
+          `Direct-Markdown bubble has background at width ${width}`);
+        assert.ok(raw.includes("\x1b[38;2;200;210;220m"), "Foreground styling is preserved");
+        const plain = stripTerminalSequences(raw);
+        assert.ok(plain.includes("中") && plain.includes("文"), "Unicode text is preserved");
+      }
+    }
+  } finally {
+    directMarkdownUserMessages = false;
+  }
 }
 
 // User Copy follows the native message mouse route and preserves source text.
