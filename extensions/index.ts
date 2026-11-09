@@ -1731,7 +1731,12 @@ export default function prettyTui(pi: ExtensionAPI) {
 
       const needsRender =
         !this.cachedLines || this.cachedText !== this.text || this.cachedWidth !== width;
-      if (needsRender) this[codeBlockCollectionKey] = [];
+      if (needsRender) {
+        this[codeBlockCollectionKey] = [];
+        // Pi can reuse rendered blocks without calling renderToken. Rebuild
+        // them with their copy regions; the full-render cache still applies.
+        this.blocks = undefined;
+      }
 
       const lines = originalRender.call(this, width);
       if (!needsRender) return lines;
